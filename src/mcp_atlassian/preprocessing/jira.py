@@ -46,9 +46,21 @@ _URL_TOKEN_PATTERN = re.compile(
     r"(?:https?|ftp)://\S*[^\s+*_~^?.,;:!\x00]", re.IGNORECASE
 )
 
-# Bold/italic pairing stays unbounded on purpose (Jira italicises even
-# intraword underscores), but it must not reach into a URL either.
-_BOLD_ITALIC_PATTERN = re.compile(r"([*_])(.*?)\1")
+# Bold takes the space-side half of the flanking rule and nothing else: the
+# opening ``*`` hugs its content and so does the closing one.  That is what
+# keeps arithmetic prose such as ``area = 5 * 3 and volume = 2 * 4`` from
+# reading back as ``5 ** 3``.  It deliberately gets no word-character rule,
+# unlike ``+`` or ``??``: Jira does render intraword bold, so ``a*b*c`` has to
+# keep converting to ``a**b**c``.
+#
+# Italic pairing stays fully unbounded, because Jira's renderer italicises even
+# intraword underscores -- ``a_b.py and c_d.py`` really is rendered with italics
+# in Jira, and the write path escapes intraword underscore runs for exactly that
+# reason (see ``escape_intraword_underscore_runs``).  Bounding the read side
+# would break fidelity with Jira's renderer rather than restore it.
+#
+# Neither marker may reach into a URL; ``_sub_outside_urls`` enforces that.
+_BOLD_ITALIC_PATTERN = re.compile(r"\*(?!\s)(.*?)(?<!\s)\*|_(.*?)_")
 
 
 def _protect_escaped_chars(text: str) -> str:
@@ -196,6 +208,22 @@ def _convert_inline_markup(text: str) -> str:
 
         text = _sub_outside_urls(pattern, _wrap, text, marker_length=len(marker))
     return text
+
+
+def _wrap_bold_or_italic(match: re.Match[str]) -> str:
+    """Convert one paired ``*`` or ``_`` span to its markdown equivalent.
+
+    Args:
+        match: Match from ``_BOLD_ITALIC_PATTERN``; group 1 holds the content
+            of a bold span, group 2 the content of an italic one.
+
+    Returns:
+        The content wrapped in ``**`` for bold, or in ``*`` for italic.
+    """
+    bold = match.group(1)
+    if bold is not None:
+        return f"**{bold}**"
+    return f"*{match.group(2)}*"
 
 
 def _convert_panel(params: str | None, content: str) -> str:
@@ -465,18 +493,11 @@ class JiraPreprocessor(BasePreprocessor):
         # Block quotes
         output = re.sub(r"^bq\.(.*?)$", r"> \1\n", output, flags=re.MULTILINE)
 
-        # Text formatting (bold, italic).  The pairing is unbounded, matching
-        # Jira's own renderer, but it stops at URL boundaries so a link with
-        # underscores in its path stays clickable.
-        output = _sub_outside_urls(
-            _BOLD_ITALIC_PATTERN,
-            lambda match: (
-                ("**" if match.group(1) == "*" else "*")
-                + match.group(2)
-                + ("**" if match.group(1) == "*" else "*")
-            ),
-            output,
-        )
+        # Text formatting (bold, italic).  Bold requires a non-space on the
+        # inside of each marker; italic pairing stays unbounded, matching
+        # Jira's own renderer.  Both stop at URL boundaries, so a link with
+        # underscores in its path stays clickable.  See _BOLD_ITALIC_PATTERN.
+        output = _sub_outside_urls(_BOLD_ITALIC_PATTERN, _wrap_bold_or_italic, output)
 
         # Multi-level numbered list
         output = re.sub(

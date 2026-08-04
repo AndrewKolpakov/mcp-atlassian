@@ -1673,6 +1673,10 @@ class TestInlineMarkupBoundaries:
     characters out of text nobody wrote as markup.  A span now has to look
     like markup: its content holds no whitespace, or else it opens at the
     start of a line or after whitespace -- and it never sits inside a URL.
+
+    ``*`` takes only the space-side half of that rule, because Jira does render
+    intraword bold, and ``_`` keeps its unbounded pairing because Jira
+    italicises intraword underscores as well.
     """
 
     @pytest.fixture
@@ -1742,6 +1746,11 @@ class TestInlineMarkupBoundaries:
         Each marker here either wraps whitespace-edged content, or -- when it
         wraps several words -- opens against punctuation rather than
         whitespace, so none of them pair.
+
+        One parameter is a characterization case with no detection power
+        against this change: ``two-hyphen-ranges`` passes identically without
+        it, because the substitution this change deleted rewrote ``-text-`` to
+        itself.  It stays to document that hyphens are out of scope.
         """
         assert preprocessor.jira_to_markdown(text) == expected
         assert preprocessor.clean_jira_text(text) == expected
@@ -1877,7 +1886,7 @@ class TestInlineMarkupBoundaries:
 
         A rewritten marker turns a live link into a dead one, which is the
         headline symptom this module guards against.  The guard covers the
-        unbounded bold/italic pairing too, so a path with underscores stays
+        still-unbounded italic pairing too, so a path with underscores stays
         clickable.
         """
         assert preprocessor.jira_to_markdown(text) == text
@@ -1916,6 +1925,16 @@ class TestInlineMarkupBoundaries:
             pytest.param(
                 r"checklist \+ kit", r"checklist \+ kit", id="escaped-plus-in-prose"
             ),
+            pytest.param(
+                r"\*not bold\* and *bold*",
+                r"\*not bold\* and **bold**",
+                id="escaped-and-real-bold",
+            ),
+            pytest.param(
+                r"a\_b.py and _italic_",
+                r"a\_b.py and *italic*",
+                id="escaped-and-real-italic",
+            ),
         ],
     )
     def test_escaped_markers_stay_escaped(self, preprocessor, text: str, expected: str):
@@ -1925,6 +1944,11 @@ class TestInlineMarkupBoundaries:
         markdown must not turn into emphasis, and every one of these
         characters is ASCII punctuation, for which ``\\c`` is a valid markdown
         escape rendering as the bare character.
+
+        The two mixed parameters put an escaped marker beside a real span, so
+        they are the ones that reach the ``*``/``_`` conversion: without the
+        escape extraction the escaped marker pairs with the genuine one and
+        both halves come out wrong.
         """
         assert preprocessor.jira_to_markdown(text) == expected
 
@@ -1959,10 +1983,13 @@ class TestInlineMarkupBoundaries:
     def test_strikethrough_marker_is_left_untouched(self, preprocessor):
         """``-text-`` is deliberately not converted.
 
-        A flanking rule cannot separate markup from prose on hyphens, where
-        ranges such as "rows 3-5 and 7-9" look exactly like a span.  The
-        previous no-op substitution that replaced ``-text-`` by itself has
-        been removed rather than turned into a real conversion.
+        Characterization test: it passes identically without the production
+        change, so it has no detection power against it -- the substitution
+        this change deleted rewrote ``-text-`` to itself.  What it documents
+        is that hyphens are out of scope: a flanking rule cannot separate
+        markup from prose on them, where ranges such as "rows 3-5 and 7-9"
+        look exactly like a span.  The dead no-op was removed rather than
+        turned into a real conversion.
         """
         assert preprocessor.jira_to_markdown("-text-") == "-text-"
 
@@ -1971,30 +1998,62 @@ class TestInlineMarkupBoundaries:
         [
             pytest.param(
                 "area = 5 * 3 and volume = 2 * 4",
-                "area = 5 ** 3 and volume = 2 ** 4",
-                id="asterisk-prose",
+                "area = 5 * 3 and volume = 2 * 4",
+                id="two-multiplications",
             ),
-            pytest.param(
-                "files a_b.py and c_d.py",
-                "files a*b.py and c*d.py",
-                id="underscore-prose",
-            ),
+            pytest.param("x* y *z", "x* y *z", id="markers-facing-outwards"),
         ],
     )
-    def test_bold_and_italic_boundaries_are_out_of_scope(
-        self, preprocessor, text: str, expected: str
-    ):
-        """``*`` and ``_`` keep their unbounded pairing on purpose.
+    def test_asterisk_prose_survives(self, preprocessor, text: str, expected: str):
+        """``*`` takes the space-side half of the flanking rule.
 
-        The Jira renderer italicises even intraword underscores, so
-        ``a_b.py and c_d.py`` really does render with italics in Jira; the
-        write path escapes intraword underscore runs precisely because of
-        that (see ``escape_intraword_underscore_runs``).  Only escape
-        handling and the URL guard were added for these two markers, so the
-        pairing below is expected -- changing it means changing the fidelity
-        contract with Jira's own renderer.
+        Arithmetic prose used to read back as ``area = 5 ** 3 and volume =
+        2 ** 4``, which is corruption rather than markup.  The opening ``*``
+        must now be followed by a non-space and the closing one preceded by a
+        non-space, which is exactly what multiplication signs fail.
         """
         assert preprocessor.jira_to_markdown(text) == expected
+        assert preprocessor.clean_jira_text(text) == expected
+
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            pytest.param("*bold text*", "**bold text**", id="whole-field"),
+            pytest.param("a*b*c", "a**b**c", id="intraword"),
+            pytest.param("x *y* z", "x **y** z", id="mid-sentence"),
+            pytest.param("a *b c* d", "a **b c** d", id="multi-word"),
+        ],
+    )
+    def test_bold_still_converts_including_intraword(
+        self, preprocessor, text: str, expected: str
+    ):
+        """``*`` gets the space-side rule only -- never a word-character one.
+
+        Every case here also passes without the production change, so this has
+        no detection power against it either.  What it does detect is the
+        over-correction: Jira renders intraword bold, so adding the
+        word-character guards that ``+`` and ``??`` carry would silently drop
+        markup Jira itself renders, and ``a*b*c`` would stop converting.
+        """
+        assert preprocessor.jira_to_markdown(text) == expected
+
+    def test_underscore_boundaries_are_out_of_scope(self, preprocessor):
+        """``_`` keeps its unbounded pairing on purpose, unlike ``*``.
+
+        Characterization test: this assertion holds identically without the
+        production change, so it has no detection power against it.  It is
+        here to document the deliberate asymmetry.  The Jira renderer
+        italicises even intraword underscores, so ``a_b.py and c_d.py`` really
+        does render with italics in Jira; the write path escapes intraword
+        underscore runs precisely because of that (see
+        ``escape_intraword_underscore_runs``).  Only escape handling and the
+        URL guard were added for this marker -- changing the pairing means
+        changing the fidelity contract with Jira's own renderer.
+        """
+        assert (
+            preprocessor.jira_to_markdown("files a_b.py and c_d.py")
+            == "files a*b.py and c*d.py"
+        )
 
     def test_confluence_smart_link_url_keeps_its_plus_signs(self, preprocessor):
         """A Confluence page URL must survive the read path intact."""
