@@ -1,9 +1,14 @@
 import re
+import time
 
 import pytest
 
 from mcp_atlassian.preprocessing.confluence import ConfluencePreprocessor
-from mcp_atlassian.preprocessing.jira import JiraPreprocessor
+from mcp_atlassian.preprocessing.jira import (
+    _ESCAPABLE_CHARS,
+    JiraPreprocessor,
+    _protect_escaped_chars,
+)
 from tests.fixtures.confluence_mocks import MOCK_COMMENTS_RESPONSE, MOCK_PAGE_RESPONSE
 from tests.fixtures.jira_mocks import MOCK_JIRA_ISSUE_RESPONSE
 from tests.utils.mocks import MockConfluenceClient
@@ -143,14 +148,15 @@ def test_clean_jira_text_smart_links(preprocessor_with_jira):
     cleaned = preprocessor_with_jira.clean_jira_text(text)
     assert cleaned == f"[PROJ-123]({base_url}/browse/PROJ-123)"
 
-    # Test Confluence page link from mock data
+    # Test Confluence page link from mock data.  The title has its "+"
+    # separators turned into spaces, while the URL keeps them verbatim --
+    # stripping them would produce a dead link.
     confluence_url = (
         f"{base_url}/wiki/spaces/PROJ/pages/987654321/Example+Meeting+Notes"
     )
-    processed_url = f"{base_url}/wiki/spaces/PROJ/pages/987654321/ExampleMeetingNotes"
     text = f"[Meeting Notes|{confluence_url}|smart-link]"
     cleaned = preprocessor_with_jira.clean_jira_text(text)
-    assert cleaned == f"[Example Meeting Notes]({processed_url})"
+    assert cleaned == f"[Example Meeting Notes]({confluence_url})"
 
 
 @pytest.mark.parametrize(
@@ -1656,3 +1662,389 @@ class TestHtmlConversionCodeProtection:
         """Direct test of _convert_html_to_markdown with markdown code spans."""
         result = preprocessor._convert_html_to_markdown(md_input)
         assert expected_substr in result, f"Expected '{expected_substr}' in: {result!r}"
+
+
+class TestInlineMarkupBoundaries:
+    """Boundary rules for Jira inline markup on the read path.
+
+    The v2 read endpoint returns literal characters as literals (Jira escapes
+    some of them with a backslash), so ``+``, ``^``, ``~`` and ``??`` turn up
+    in ordinary prose.  Any second occurrence used to close a span, which ate
+    characters out of text nobody wrote as markup.  A span now has to look
+    like markup: its content holds no whitespace, or else it opens at the
+    start of a line or after whitespace -- and it never sits inside a URL.
+    """
+
+    @pytest.fixture
+    def preprocessor(self):
+        return JiraPreprocessor(base_url="https://example.atlassian.net")
+
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            pytest.param(
+                "see ~/tmp and ~/var",
+                "see ~/tmp and ~/var",
+                id="two-home-paths",
+            ),
+            pytest.param("x^2 plus y^2", "x^2 plus y^2", id="two-exponents"),
+            pytest.param(
+                "checklist + kit; date + 4 weeks",
+                "checklist + kit; date + 4 weeks",
+                id="two-plus-signs",
+            ),
+            pytest.param("why?? really??", "why?? really??", id="two-citations"),
+            pytest.param(
+                "rows 3-5 and 7-9",
+                "rows 3-5 and 7-9",
+                id="two-hyphen-ranges",
+            ),
+            pytest.param(
+                "12:30~13:00 and 14:00~15:00",
+                "12:30~13:00 and 14:00~15:00",
+                id="two-time-ranges",
+            ),
+            pytest.param(
+                "Q1 ~ Q3 growth ~ 5%",
+                "Q1 ~ Q3 growth ~ 5%",
+                id="two-approximations",
+            ),
+            pytest.param(
+                "cost $5+$6 and $7+$8",
+                "cost $5+$6 and $7+$8",
+                id="two-sums",
+            ),
+            pytest.param(
+                'see "~/tmp" and "~/var"',
+                'see "~/tmp" and "~/var"',
+                id="quoted-home-paths",
+            ),
+            pytest.param(
+                "(~/tmp) and (~/var)",
+                "(~/tmp) and (~/var)",
+                id="parenthesised-home-paths",
+            ),
+            pytest.param(
+                "ranges (1..5) (+/-) (+/-)",
+                "ranges (1..5) (+/-) (+/-)",
+                id="parenthesised-plus-minus",
+            ),
+            pytest.param(
+                "a+b and c+d",
+                "a+b and c+d",
+                id="two-intraword-plus-signs",
+            ),
+        ],
+    )
+    def test_literal_prose_survives(self, preprocessor, text: str, expected: str):
+        """Prose whose marker characters never form a markup-shaped span.
+
+        Each marker here either wraps whitespace-edged content, or -- when it
+        wraps several words -- opens against punctuation rather than
+        whitespace, so none of them pair.
+        """
+        assert preprocessor.jira_to_markdown(text) == expected
+        assert preprocessor.clean_jira_text(text) == expected
+
+    def test_bracketed_marker_prose_keeps_its_markers(self, preprocessor):
+        """``[+] done and [+] pending`` keeps both plus signs.
+
+        The brackets themselves are dropped further down the pipeline, where
+        ``[text]`` is Jira's own link syntax; that is orthogonal to the marker
+        rule, which is what this test pins.
+        """
+        result = preprocessor.jira_to_markdown("[+] done and [+] pending")
+        assert "<ins>" not in result
+        assert result == "+ done and + pending"
+
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            pytest.param("+inserted+", "<ins>inserted</ins>", id="inserted"),
+            pytest.param("^sup^", "<sup>sup</sup>", id="superscript"),
+            pytest.param("~sub~", "<sub>sub</sub>", id="subscript"),
+            pytest.param("??cited??", "<cite>cited</cite>", id="citation"),
+            pytest.param(
+                "see +this+ and +that+",
+                "see <ins>this</ins> and <ins>that</ins>",
+                id="two-inserted-spans",
+            ),
+            pytest.param(
+                "a ??quoted bit?? here",
+                "a <cite>quoted bit</cite> here",
+                id="citation-mid-sentence",
+            ),
+            pytest.param(
+                "this is +very important+.",
+                "this is <ins>very important</ins>.",
+                id="span-before-full-stop",
+            ),
+            pytest.param("(+ok+)", "(<ins>ok</ins>)", id="single-token-in-brackets"),
+            pytest.param("|+ok+|", "|<ins>ok</ins>|", id="single-token-in-table-cell"),
+            pytest.param(
+                "??is this cited? yes??",
+                "<cite>is this cited? yes</cite>",
+                id="citation-containing-question-mark",
+            ),
+        ],
+    )
+    def test_genuine_markup_still_converts(
+        self, preprocessor, text: str, expected: str
+    ):
+        """Marker pairs that look like markup are still converted."""
+        assert preprocessor.jira_to_markdown(text) == expected
+
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            pytest.param("H~2~O", "H<sub>2</sub>O", id="chemical-formula"),
+            pytest.param(
+                "CO~2~ emissions",
+                "CO<sub>2</sub> emissions",
+                id="subscript-then-space",
+            ),
+            pytest.param("2^10^ bytes", "2<sup>10</sup> bytes", id="power-of-two"),
+            pytest.param("1^st^ place", "1<sup>st</sup> place", id="ordinal"),
+            pytest.param("m^3^", "m<sup>3</sup>", id="cubic-metre"),
+            pytest.param(
+                "T~1~ and T~2~",
+                "T<sub>1</sub> and T<sub>2</sub>",
+                id="two-subscripts",
+            ),
+            pytest.param(
+                "e^x^ + e^y^",
+                "e<sup>x</sup> + e<sup>y</sup>",
+                id="two-superscripts-around-a-plus",
+            ),
+        ],
+    )
+    def test_intraword_superscript_and_subscript_convert(
+        self, preprocessor, text: str, expected: str
+    ):
+        """Superscript and subscript are converted inside a word.
+
+        That is where Jira's renderer puts them and where they are practically
+        always written, and it is what ``markdown_to_jira`` emits, so refusing
+        to read them back would mean writing markup this library cannot parse
+        (see ``test_sub_sup_and_ins_round_trip``).  It stays unambiguous
+        because the span content may not contain whitespace, which is what
+        separates ``H~2~O`` from prose like ``x^2 plus y^2``.
+        """
+        assert preprocessor.jira_to_markdown(text) == expected
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            pytest.param("a+b+c", id="intraword-inserted"),
+            pytest.param("x??inline??y", id="intraword-citation"),
+        ],
+    )
+    def test_intraword_plus_and_citation_are_left_alone(self, preprocessor, text: str):
+        """``+`` and ``??`` get no intraword arm, unlike ``^`` and ``~``.
+
+        Intraword ``+`` is how Confluence page paths and URL query strings
+        join words (``.../Example+Meeting+Notes``), and ``a??b??c`` is
+        null-coalescing code; both are far more common than intraword
+        inserted text or citations.  The cost is a marker left visible rather
+        than a mangled link, and the write path can produce such markup, so
+        this is a deliberate one-way trade.
+        """
+        assert preprocessor.jira_to_markdown(text) == text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            pytest.param("https://ex.com/s?q=+foo+", id="plus-in-query"),
+            pytest.param("https://ex.com/a?b=+x+&c=1", id="plus-in-query-param"),
+            pytest.param(
+                "https://ex.com/wiki/Example+Meeting+Notes",
+                id="plus-in-confluence-path",
+            ),
+            pytest.param("https://ex.com/~user/~backup", id="tilde-in-path"),
+            pytest.param("https://ex.com/a^b^c", id="caret-in-path"),
+            pytest.param(
+                "https://ex.com/a_b_c and https://ex.com/d_e_f",
+                id="underscores-in-two-paths",
+            ),
+            pytest.param(
+                "see https://ex.com/x?q=+a+ and https://ex.com/y?q=+b+ now",
+                id="two-urls-in-a-sentence",
+            ),
+        ],
+    )
+    def test_urls_keep_every_marker_character(self, preprocessor, text: str):
+        """No inline conversion ever reaches inside a URL.
+
+        A rewritten marker turns a live link into a dead one, which is the
+        headline symptom this module guards against.  The guard covers the
+        unbounded bold/italic pairing too, so a path with underscores stays
+        clickable.
+        """
+        assert preprocessor.jira_to_markdown(text) == text
+        assert preprocessor.clean_jira_text(text) == text
+
+    def test_markup_wrapping_a_url_still_converts(self, preprocessor):
+        """A span may still wrap a whole URL; only spans inside one are kept."""
+        assert (
+            preprocessor.jira_to_markdown("+https://ex.com/a+")
+            == "<ins>https://ex.com/a</ins>"
+        )
+
+    def test_multiword_span_against_punctuation_is_not_converted(self, preprocessor):
+        """A known, deliberate false negative.
+
+        A multi-word span has to open at the start of a line or after
+        whitespace, because that is the only thing separating markup from
+        prose such as ``see "~/tmp" and "~/var"``.  ``(+two words+)`` pays for
+        that with a marker left visible -- lossless, unlike silently eating
+        the characters between two literal markers.
+        """
+        assert preprocessor.jira_to_markdown("(+two words+)") == "(+two words+)"
+
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            pytest.param(r"\+literal\+", r"\+literal\+", id="escaped-plus"),
+            pytest.param(r"\*not bold\*", r"\*not bold\*", id="escaped-asterisk"),
+            pytest.param(r"a\_b.py", r"a\_b.py", id="escaped-underscore"),
+            pytest.param(r"\~home", r"\~home", id="escaped-tilde"),
+            pytest.param(r"2\^10", r"2\^10", id="escaped-caret"),
+            pytest.param(
+                r"\?\?not cited\?\?", r"\?\?not cited\?\?", id="escaped-question-marks"
+            ),
+            pytest.param(r"\-not struck\-", r"\-not struck\-", id="escaped-hyphens"),
+            pytest.param(
+                r"checklist \+ kit", r"checklist \+ kit", id="escaped-plus-in-prose"
+            ),
+        ],
+    )
+    def test_escaped_markers_stay_escaped(self, preprocessor, text: str, expected: str):
+        """A backslash-escaped marker opens no span and stays literal.
+
+        The escape is kept rather than dropped: ``\\*not bold\\*`` read as
+        markdown must not turn into emphasis, and every one of these
+        characters is ASCII punctuation, for which ``\\c`` is a valid markdown
+        escape rendering as the bare character.
+        """
+        assert preprocessor.jira_to_markdown(text) == expected
+
+    def test_escaped_backslash_does_not_swallow_the_next_marker(self, preprocessor):
+        r"""``C:\\+foo+`` is a literal backslash followed by real markup."""
+        assert preprocessor.jira_to_markdown("C:\\\\+foo+") == "C:\\\\<ins>foo</ins>"
+
+    def test_escape_restoration_does_not_scale_with_occurrences(self, preprocessor):
+        """Restoring escapes must cost one pass, not one pass per escape.
+
+        A per-occurrence placeholder list needs a full-text ``str.replace``
+        for every stored item, which made a single 32 KB field of escaped
+        markers (Jira's field cap) take ~1.5 s of pure read path.
+        """
+        protected = _protect_escaped_chars(r"\+" * 5000 + r"\_" * 5000)
+        placeholders = set(re.findall(r"\x00ESC\d+\x00", protected))
+        assert len(placeholders) == 2, "one placeholder per character, not per escape"
+        assert len(placeholders) < len(_ESCAPABLE_CHARS)
+
+        field = r"\+" * 16383
+        start = time.perf_counter()
+        result = preprocessor.jira_to_markdown(field)
+        elapsed = time.perf_counter() - start
+        assert result == r"\+" * 16383
+        assert elapsed < 0.5, f"32 KB of escapes took {elapsed:.3f}s"
+
+    def test_spans_do_not_cross_a_line_break(self, preprocessor):
+        """A marker on one line never pairs with a marker on the next."""
+        text = "first ~line\nsecond~ line"
+        assert preprocessor.jira_to_markdown(text) == text
+
+    def test_strikethrough_marker_is_left_untouched(self, preprocessor):
+        """``-text-`` is deliberately not converted.
+
+        A flanking rule cannot separate markup from prose on hyphens, where
+        ranges such as "rows 3-5 and 7-9" look exactly like a span.  The
+        previous no-op substitution that replaced ``-text-`` by itself has
+        been removed rather than turned into a real conversion.
+        """
+        assert preprocessor.jira_to_markdown("-text-") == "-text-"
+
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            pytest.param(
+                "area = 5 * 3 and volume = 2 * 4",
+                "area = 5 ** 3 and volume = 2 ** 4",
+                id="asterisk-prose",
+            ),
+            pytest.param(
+                "files a_b.py and c_d.py",
+                "files a*b.py and c*d.py",
+                id="underscore-prose",
+            ),
+        ],
+    )
+    def test_bold_and_italic_boundaries_are_out_of_scope(
+        self, preprocessor, text: str, expected: str
+    ):
+        """``*`` and ``_`` keep their unbounded pairing on purpose.
+
+        The Jira renderer italicises even intraword underscores, so
+        ``a_b.py and c_d.py`` really does render with italics in Jira; the
+        write path escapes intraword underscore runs precisely because of
+        that (see ``escape_intraword_underscore_runs``).  Only escape
+        handling and the URL guard were added for these two markers, so the
+        pairing below is expected -- changing it means changing the fidelity
+        contract with Jira's own renderer.
+        """
+        assert preprocessor.jira_to_markdown(text) == expected
+
+    def test_confluence_smart_link_url_keeps_its_plus_signs(self, preprocessor):
+        """A Confluence page URL must survive the read path intact."""
+        url = (
+            "https://example.atlassian.net/wiki/spaces/PROJ/pages/987654321/"
+            "Example+Meeting+Notes"
+        )
+        result = preprocessor.clean_jira_text(f"[Meeting Notes|{url}|smart-link]")
+        assert result == f"[Example Meeting Notes]({url})"
+
+    @pytest.mark.parametrize(
+        "markdown",
+        [
+            pytest.param("H<sub>2</sub>O", id="chemical-formula"),
+            pytest.param("CO<sub>2</sub> emissions", id="subscript-then-space"),
+            pytest.param("2<sup>10</sup> bytes", id="power-of-two"),
+            pytest.param("1<sup>st</sup> place", id="ordinal"),
+            pytest.param("m<sup>3</sup>", id="cubic-metre"),
+            pytest.param("T<sub>1</sub> and T<sub>2</sub>", id="two-subscripts"),
+            pytest.param("e<sup>x</sup> + e<sup>y</sup>", id="two-superscripts"),
+            pytest.param("the <ins>new</ins> value", id="inserted-span"),
+            pytest.param("<cite>quoted</cite> text", id="citation-span"),
+        ],
+    )
+    def test_sub_sup_and_ins_round_trip(self, preprocessor, markdown: str):
+        """What the write path emits, the read path reads back.
+
+        ``markdown_to_jira`` maps ``<sub>``/``<sup>``/``<ins>``/``<cite>``
+        onto ``~``/``^``/``+``/``??`` with no boundary logic at all, so every
+        span it can write has to survive the round trip.
+        """
+        jira = preprocessor.markdown_to_jira(markdown)
+        assert preprocessor.jira_to_markdown(jira) == markdown
+
+    @pytest.mark.parametrize(
+        "markdown, jira",
+        [
+            pytest.param("a<ins>b</ins>c", "a+b+c", id="intraword-inserted"),
+            pytest.param("x<cite>y</cite>z", "x??y??z", id="intraword-citation"),
+        ],
+    )
+    def test_intraword_ins_and_cite_do_not_round_trip(
+        self, preprocessor, markdown: str, jira: str
+    ):
+        """The two spans the write path can emit and the read path will not take.
+
+        Reading them back would mean converting the ``+`` in every Confluence
+        page path and the ``??`` in every null-coalescing expression; see
+        ``test_intraword_plus_and_citation_are_left_alone``.  The markup stays
+        visible in the markdown instead of being silently dropped.
+        """
+        assert preprocessor.markdown_to_jira(markdown) == jira
+        assert preprocessor.jira_to_markdown(jira) == jira

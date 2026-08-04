@@ -2,6 +2,8 @@
 
 import logging
 import re
+from bisect import bisect_right
+from collections.abc import Callable
 from typing import Any
 
 from .base import BasePreprocessor, _extract_blocks, _restore_blocks
@@ -9,6 +11,191 @@ from .base import BasePreprocessor, _extract_blocks, _restore_blocks
 logger = logging.getLogger("mcp-atlassian")
 
 _ISSUE_KEY_PATTERN = r"[A-Z][A-Z0-9_]+-\d+(?:-\d+)*"
+
+# Characters Jira escapes with a leading backslash when they are meant
+# literally: the markup markers, plus the backslash itself.  Every escape is
+# pulled out of the text before any markup conversion runs, so an escaped
+# character can neither open nor close a span, and is put back afterwards as
+# the markdown escape ``\c`` -- keeping the escape is what keeps the character
+# literal for a markdown reader too, since a bare ``*not bold*`` would render
+# as emphasis.  ``\\`` restores as ``\\``, a literal backslash in markdown.
+#
+# The restored text is fully determined by the character, so there is one
+# fixed placeholder per character rather than one per occurrence: restoring an
+# indexed placeholder list costs a full-text pass per stored item, which made
+# escaped text quadratic (1.5 s for a single 32 KB field).
+_ESCAPABLE_CHARS = "\\+*_~^?-"
+_ESCAPED_CHAR_PATTERN = re.compile(
+    "\\\\([" + "".join(re.escape(char) for char in _ESCAPABLE_CHARS) + "])"
+)
+# Kept short on purpose: a field of nothing but escapes is rewritten into
+# these placeholders, and every downstream regex then walks the longer text.
+_ESCAPE_PLACEHOLDERS = {
+    char: f"\x00ESC{index}\x00" for index, char in enumerate(_ESCAPABLE_CHARS)
+}
+_ESCAPE_PLACEHOLDER_PATTERN = re.compile(r"\x00ESC(\d+)\x00")
+
+# A URL is a single token that has to survive the read path byte for byte: a
+# marker converted inside one produces a dead link, which is the reason this
+# module bounds inline markup at all.  Spans delimited inside such a token are
+# left alone, so both ``.../Example+Meeting+Notes`` and ``?q=+foo+`` keep
+# their plus signs.  A trailing marker, sentence punctuation or placeholder is
+# left outside the token, so markup *wrapping* a whole URL still converts, as
+# in ``+https://example.com/a+.``
+_URL_TOKEN_PATTERN = re.compile(
+    r"(?:https?|ftp)://\S*[^\s+*_~^?.,;:!\x00]", re.IGNORECASE
+)
+
+# Bold/italic pairing stays unbounded on purpose (Jira italicises even
+# intraword underscores), but it must not reach into a URL either.
+_BOLD_ITALIC_PATTERN = re.compile(r"([*_])(.*?)\1")
+
+
+def _protect_escaped_chars(text: str) -> str:
+    r"""Replace every ``\c`` escape with a per-character placeholder."""
+    return _ESCAPED_CHAR_PATTERN.sub(
+        lambda match: _ESCAPE_PLACEHOLDERS[match.group(1)], text
+    )
+
+
+def _restore_escaped_chars(text: str) -> str:
+    """Turn escape placeholders back into markdown escapes."""
+    return _ESCAPE_PLACEHOLDER_PATTERN.sub(
+        lambda match: "\\" + _ESCAPABLE_CHARS[int(match.group(1))], text
+    )
+
+
+def _sub_outside_urls(
+    pattern: re.Pattern[str],
+    repl: Callable[[re.Match[str]], str],
+    text: str,
+    *,
+    marker_length: int = 1,
+) -> str:
+    """Substitute ``pattern`` except where a delimiter sits inside a URL.
+
+    Args:
+        pattern: Compiled pattern whose match starts and ends with a marker.
+        repl: Replacement callback, applied only to matches clear of a URL.
+        text: Text to substitute in.
+        marker_length: Length of the closing marker, used to locate it.
+
+    Returns:
+        Text with every match delimited outside a URL token replaced.
+    """
+    # Fast path: no scheme, so no URL to protect.  Worth the check because
+    # this runs once per marker per field on every issue read.
+    if "://" not in text:
+        return pattern.sub(repl, text)
+    spans = [match.span() for match in _URL_TOKEN_PATTERN.finditer(text)]
+    if not spans:
+        return pattern.sub(repl, text)
+    starts = [start for start, _ in spans]
+    ends = [end for _, end in spans]
+
+    def _inside_url(position: int) -> bool:
+        # finditer yields non-overlapping spans in order, so the only span
+        # that can hold the position is the last one starting at or before it.
+        index = bisect_right(starts, position) - 1
+        return index >= 0 and position < ends[index]
+
+    def _guarded(match: re.Match[str]) -> str:
+        if _inside_url(match.start()) or _inside_url(match.end() - marker_length):
+            return match.group(0)
+        return repl(match)
+
+    return pattern.sub(_guarded, text)
+
+
+def _inline_markup_pattern(marker: str, *, intraword: bool) -> re.Pattern[str]:
+    """Build the pattern that pairs one Jira inline marker.
+
+    Two span shapes count as markup, and neither ever crosses a line break:
+
+    * A *tight* span, whose content holds no whitespace -- ``+ok+``,
+      ``(+ok+)``, ``H~2~O``.  With ``intraword`` set the span may also sit
+      inside a word, because that is where superscript and subscript nearly
+      always appear (``H~2~O``, ``CO~2~``, ``1^st^``, ``2^10^``) and because
+      this library writes exactly that: ``markdown_to_jira`` turns
+      ``<sub>2</sub>`` into ``~2~`` with no boundary logic, so refusing to
+      read it back would mean writing markup we cannot parse.  It stays off
+      for ``+`` and ``??``, where the same shape is overwhelmingly not markup:
+      a Confluence page path or a URL query string joins words with ``+``, and
+      ``a??b??c`` is null-coalescing code rather than a citation.
+    * A *loose* span, whose content holds whitespace -- ``+two words+``.  It
+      must open at the start of a line or after whitespace, so prose whose
+      markers merely hug punctuation keeps them: ``[+] done and [+] pending``,
+      ``see "~/tmp" and "~/var"``, ``(+/-) (+/-)``.  The cost is a missed
+      ``(+two words+)`` -- a marker left visible, not text silently eaten.
+
+    Either way the opening marker hugs its content, the closing marker hugs
+    its content and is not followed by a word character, and the content never
+    contains the marker.  Prose such as ``x^2 plus y^2``, ``date + 4 weeks``,
+    ``12:30~13:00 and 14:00~15:00`` or ``cost $5+$6 and $7+$8`` therefore
+    survives untouched instead of losing characters to a stray second marker.
+
+    Args:
+        marker: Literal wiki marker delimiting the span, e.g. ``"+"``.
+        intraword: Whether a tight span may sit inside a word.
+
+    Returns:
+        Compiled pattern whose first or second group holds the span content.
+    """
+    esc = re.escape(marker)
+    if len(marker) == 1:
+        # "Anything but the marker" as a character class, which the regex
+        # engine walks far faster than a lookahead per character.
+        tight_content = rf"[^\s{esc}]+"
+        loose_content = rf"[^\s{esc}][^\n{esc}]*"
+    else:
+        not_marker = f"(?!{esc})"
+        tight_content = rf"(?:{not_marker}\S)+?"
+        loose_content = rf"{not_marker}\S(?:{not_marker}[^\n])*?"
+    # Every branch opens with the marker itself rather than a lookbehind, so
+    # the engine can scan straight to the next marker instead of testing every
+    # position; each boundary rule is then a lookbehind spanning the character
+    # before the marker plus the marker.  Leading with the lookbehind costs
+    # ~70x on marker-free prose, which is most of what a read path sees.
+    if intraword:
+        tight = rf"{esc}(?<!\\{esc})({tight_content}){esc}"
+    else:
+        tight = rf"{esc}(?<![\w\\]{esc})({tight_content}){esc}(?!\w)"
+    # "(?<![^\s]MARKER)" is "the marker starts the text or follows whitespace".
+    loose = rf"{esc}(?<![^\s]{esc})({loose_content})(?<!\s){esc}(?!\w)"
+    return re.compile(f"(?:{tight}|{loose})")
+
+
+# Marker, tag and intraword rule for every inline span the read path converts.
+# Strikethrough (``-text-``) is deliberately absent: no flanking rule can tell
+# markup from prose on hyphens, where "rows 3-5 and 7-9" looks exactly like a
+# span.
+_INLINE_MARKUP_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
+    ("??", _inline_markup_pattern("??", intraword=False), "cite"),
+    ("+", _inline_markup_pattern("+", intraword=False), "ins"),
+    ("^", _inline_markup_pattern("^", intraword=True), "sup"),
+    ("~", _inline_markup_pattern("~", intraword=True), "sub"),
+)
+
+
+def _convert_inline_markup(text: str) -> str:
+    """Convert Jira citation, inserted, superscript and subscript spans.
+
+    Args:
+        text: Text in Jira wiki markup, with escapes already protected.
+
+    Returns:
+        Text with every paired marker replaced by its HTML tag.
+    """
+    for marker, pattern, tag in _INLINE_MARKUP_RULES:
+
+        def _wrap(match: re.Match[str], tag: str = tag) -> str:
+            content = match.group(1)
+            if content is None:
+                content = match.group(2)
+            return f"<{tag}>{content}</{tag}>"
+
+        text = _sub_outside_urls(pattern, _wrap, text, marker_length=len(marker))
+    return text
 
 
 def _convert_panel(params: str | None, content: str) -> str:
@@ -269,12 +456,20 @@ class JiraPreprocessor(BasePreprocessor):
             "INLINECODE",
         )
 
+        # Protect backslash-escaped characters the same way.  Jira emits them
+        # when the character is literal, so they must not open or close a
+        # markup span; they are restored as markdown escapes once every
+        # conversion below has run.
+        output = _protect_escaped_chars(output)
+
         # Block quotes
         output = re.sub(r"^bq\.(.*?)$", r"> \1\n", output, flags=re.MULTILINE)
 
-        # Text formatting (bold, italic)
-        output = re.sub(
-            r"([*_])(.*?)\1",
+        # Text formatting (bold, italic).  The pairing is unbounded, matching
+        # Jira's own renderer, but it stops at URL boundaries so a link with
+        # underscores in its path stays clickable.
+        output = _sub_outside_urls(
+            _BOLD_ITALIC_PATTERN,
             lambda match: (
                 ("**" if match.group(1) == "*" else "*")
                 + match.group(2)
@@ -299,24 +494,9 @@ class JiraPreprocessor(BasePreprocessor):
             flags=re.MULTILINE,
         )
 
-        # Citation (non-overlapping alternation to avoid catastrophic backtracking)
-        output = re.sub(
-            r"\?\?([^?]+(?:\?[^?]+)*)\?\?",
-            r"<cite>\1</cite>",
-            output,
-        )
-
-        # Inserted text
-        output = re.sub(r"\+([^+]*)\+", r"<ins>\1</ins>", output)
-
-        # Superscript
-        output = re.sub(r"\^([^^]*)\^", r"<sup>\1</sup>", output)
-
-        # Subscript
-        output = re.sub(r"~([^~]*)~", r"<sub>\1</sub>", output)
-
-        # Strikethrough
-        output = re.sub(r"-([^-]*)-", r"-\1-", output)
+        # Citation, inserted text, superscript and subscript.  Strikethrough
+        # (-text-) is deliberately left alone, see _INLINE_MARKUP_RULES.
+        output = _convert_inline_markup(output)
 
         # Quote blocks
         output = re.sub(
@@ -384,7 +564,8 @@ class JiraPreprocessor(BasePreprocessor):
         # Rejoin the lines
         output = "\n".join(lines)
 
-        # Restore code/noformat blocks and inline code
+        # Restore escapes as markdown escapes, then code/inline code
+        output = _restore_escaped_chars(output)
         output = _restore_blocks(output, code_blocks, "CODEBLOCK")
         output = _restore_blocks(output, inline_codes, "INLINECODE")
 
