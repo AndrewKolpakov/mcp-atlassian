@@ -775,7 +775,8 @@ async def search(
                 "(Optional) Comma-separated fields to return in the results. "
                 "Use '*all' for all fields (custom fields Jira reports as "
                 "empty (null) are omitted), or specify individual fields like "
-                "'summary,status,assignee,priority'"
+                "'summary,status,assignee,priority'. Name a custom field "
+                "explicitly to see it even when it is null."
             ),
             default=",".join(DEFAULT_READ_JIRA_FIELDS),
         ),

@@ -1155,8 +1155,12 @@ class TestEmptyCustomFieldFiltering:
         simplified = issue.to_simplified_dict()
 
         assert field_id in simplified
-        assert simplified[field_id]["value"] == expected_value
-        assert simplified[field_id]["value"] is expected_value
+        value = simplified[field_id]["value"]
+        assert value == expected_value
+        # `0 == False` in Python, so equality alone cannot tell the two cases
+        # apart. The type is what must survive: an int must not arrive as a
+        # bool, or vice versa.
+        assert type(value) is type(expected_value)
 
     def test_display_name_dict_drops_only_null_custom_fields(self, api_data):
         """jira_get_issue / jira_search return to_display_name_dict output."""
