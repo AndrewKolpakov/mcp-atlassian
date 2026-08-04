@@ -133,30 +133,39 @@ class IssuesMixin(
             elif isinstance(fields_param, list | tuple | set):
                 fields_param = ",".join(fields_param)
 
+            # Normalize the requested entries once. Stray whitespace and empty
+            # entries ("*all ", "summary,") must not reach the wire parameter
+            # nor the model's requested_fields.
+            requested_entries = [
+                entry.strip() for entry in fields_param.split(",") if entry.strip()
+            ]
+            wants_all_fields = requested_entries == ["*all"]
+            fields_param = "*all" if wants_all_fields else ",".join(requested_entries)
+
             # Compare as sets to avoid hash randomization issues across processes
-            fields_set = (
-                set(fields_param.split(",")) if fields_param != "*all" else None
+            fields_set = None if wants_all_fields else set(requested_entries)
+            expand_params = (
+                [part.strip() for part in expand.split(",")] if expand else []
             )
+            wants_rendered = "renderedFields" in expand_params
             if fields_set == DEFAULT_READ_JIRA_FIELDS:
                 # Default fields are being used - preserve the order
                 default_fields_list = fields_param.split(",")
                 additional_fields = []
 
                 # Add appropriate fields based on expand parameter
-                if expand:
-                    expand_params = expand.split(",")
-                    if (
-                        "changelog" in expand_params
-                        and "changelog" not in default_fields_list
-                        and "changelog" not in additional_fields
-                    ):
-                        additional_fields.append("changelog")
-                    if (
-                        "renderedFields" in expand_params
-                        and "rendered" not in default_fields_list
-                        and "rendered" not in additional_fields
-                    ):
-                        additional_fields.append("rendered")
+                if (
+                    "changelog" in expand_params
+                    and "changelog" not in default_fields_list
+                    and "changelog" not in additional_fields
+                ):
+                    additional_fields.append("changelog")
+                if (
+                    wants_rendered
+                    and "rendered" not in default_fields_list
+                    and "rendered" not in additional_fields
+                ):
+                    additional_fields.append("rendered")
 
                 # Add appropriate fields based on properties parameter
                 if (
@@ -177,7 +186,6 @@ class IssuesMixin(
                 # Combine default fields with additional fields, preserving order
                 if additional_fields:
                     fields_param = ",".join(default_fields_list + additional_fields)
-            # Handle non-default fields string
 
             # Build expand parameter if provided
             expand_param = expand
@@ -278,7 +286,7 @@ class IssuesMixin(
             issue["fields"] = fields_data
 
             # Create and return the JiraIssue model, passing requested_fields
-            model_fields = "*all" if fields == "*all" else fields_param
+            model_fields = "*all" if wants_all_fields else fields_param
             return JiraIssue.from_api_response(
                 issue,
                 base_url=self.config.url if hasattr(self, "config") else None,

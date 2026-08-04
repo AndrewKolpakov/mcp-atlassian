@@ -5,6 +5,7 @@ Tests for the JiraIssue model including custom field handling,
 epic field extraction, and simplified dict conversion.
 """
 
+import json
 import re
 
 import pytest
@@ -300,6 +301,81 @@ class TestJiraIssue:
 
         assert issue.environment == "Cloud ADF"
         assert issue.to_simplified_dict()["environment"] == "Cloud ADF"
+
+    def test_from_api_response_surfaces_rendered_fields(self, jira_issue_data):
+        """Test that a ``renderedFields`` payload is parsed and surfaced."""
+        rendered = {
+            "description": "<p>Rendered description</p>",
+            "customfield_10049": "<b>Rendered custom field</b>",
+        }
+        issue = JiraIssue.from_api_response(
+            {**jira_issue_data, "renderedFields": rendered},
+            requested_fields="summary,description",
+        )
+
+        assert issue.rendered_fields == rendered
+        assert issue.to_simplified_dict()["rendered_fields"] == rendered
+
+    def test_to_simplified_dict_unchanged_without_rendered_fields(
+        self, jira_issue_data
+    ):
+        """Test the simplified dict only grows when rendered fields are returned."""
+        rendered = {"description": "<p>Rendered description</p>"}
+        without_rendered = JiraIssue.from_api_response(
+            jira_issue_data
+        ).to_simplified_dict()
+        with_rendered = JiraIssue.from_api_response(
+            {**jira_issue_data, "renderedFields": rendered}
+        ).to_simplified_dict()
+
+        assert "rendered_fields" not in without_rendered
+        assert with_rendered.pop("rendered_fields") == rendered
+        assert json.dumps(with_rendered) == json.dumps(without_rendered)
+
+    @pytest.mark.parametrize("rendered_value", [None, {}, "not-a-dict", []])
+    def test_rendered_fields_omitted_for_unusable_payload(
+        self, jira_issue_data, rendered_value
+    ):
+        """Test only a non-empty rendered fields mapping reaches the output."""
+        issue = JiraIssue.from_api_response(
+            {**jira_issue_data, "renderedFields": rendered_value}
+        )
+
+        assert "rendered_fields" not in issue.to_simplified_dict()
+
+    @pytest.mark.parametrize(
+        "requested_fields",
+        ["*all", "*all ", " *all", "*all,", " *all , "],
+        ids=["bare", "trailing-space", "leading-space", "trailing-comma", "both"],
+    )
+    def test_all_fields_spelling_keeps_every_field(
+        self, jira_issue_data, requested_fields
+    ):
+        """Test any "*all" spelling still selects every field.
+
+        ``requested_fields`` is declared as ``Literal["*all"] | list[str]``, so a
+        value like ``"*all "`` must collapse to the literal. Storing it as the
+        list ``["*all"]`` instead makes ``should_include_field`` reject every
+        field name and reduces the output to ``id``/``key``.
+        """
+        issue = JiraIssue.from_api_response(
+            jira_issue_data, requested_fields=requested_fields
+        )
+
+        assert issue.requested_fields == "*all"
+        simplified = issue.to_simplified_dict()
+        for expected in ("summary", "status", "description", "assignee"):
+            assert expected in simplified, (
+                f"{expected} missing from {sorted(simplified)}"
+            )
+
+    def test_blank_requested_field_entries_are_dropped(self, jira_issue_data):
+        """Test empty entries never reach the requested field list."""
+        issue = JiraIssue.from_api_response(
+            jira_issue_data, requested_fields="summary,,description, "
+        )
+
+        assert issue.requested_fields == ["summary", "description"]
 
     def test_from_api_response_builds_browse_url(self, jira_issue_data):
         """Test creating a browser URL from the configured Jira base URL."""

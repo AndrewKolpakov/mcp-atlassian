@@ -9,6 +9,7 @@ from requests.exceptions import HTTPError
 
 from mcp_atlassian.exceptions import MCPAtlassianAuthenticationError
 from mcp_atlassian.jira import JiraFetcher
+from mcp_atlassian.jira.constants import DEFAULT_READ_JIRA_FIELDS
 from mcp_atlassian.jira.issues import IssuesMixin, logger
 from mcp_atlassian.models.jira import JiraIssue
 from tests.utils.mocks import setup_api3_passthrough_mocks
@@ -1550,6 +1551,184 @@ class TestIssuesMixin:
         assert "summary" in simplified
         assert "description" in simplified
         assert "customfield_10049" in simplified
+
+    def test_get_issue_rendered_fields_with_explicit_fields(
+        self, issues_mixin: IssuesMixin, make_issue_data: Any
+    ) -> None:
+        """Test an explicit field list is forwarded unchanged for renderedFields.
+
+        Rendered content is selected by ``expand``, so the ``fields`` parameter
+        must not gain entries the caller never asked for.
+        """
+        issues_mixin.jira.get_issue.return_value = make_issue_data()
+
+        issues_mixin.get_issue(
+            "TEST-123", fields="summary,description", expand="renderedFields"
+        )
+
+        issues_mixin.jira.get_issue.assert_called_once_with(
+            "TEST-123",
+            expand="renderedFields",
+            fields="summary,description",
+            properties=None,
+            update_history=True,
+        )
+
+    def test_get_issue_rendered_fields_with_all_fields(
+        self, issues_mixin: IssuesMixin, make_issue_data: Any
+    ) -> None:
+        """Test '*all' is forwarded unchanged when renderedFields is expanded."""
+        issues_mixin.jira.get_issue.return_value = make_issue_data()
+
+        issues_mixin.get_issue("TEST-123", fields="*all", expand="renderedFields")
+
+        issues_mixin.jira.get_issue.assert_called_once_with(
+            "TEST-123",
+            expand="renderedFields",
+            fields="*all",
+            properties=None,
+            update_history=True,
+        )
+
+    @pytest.mark.parametrize(
+        "fields",
+        ["*all", "*all ", "*all,", ["*all"], ("*all",), {"*all"}],
+        ids=["str", "trailing-space", "trailing-comma", "list", "tuple", "set"],
+    )
+    def test_get_issue_all_fields_survives_rendered_expand(
+        self, issues_mixin: IssuesMixin, make_issue_data: Any, fields: Any
+    ) -> None:
+        """Test every '*all' spelling still returns the whole issue.
+
+        ``jira_get_issue`` normalises ``fields="*all "`` and ``fields="*all,"``
+        into ``["*all"]`` before calling this mixin, so all of these spellings
+        are reachable from the MCP tool. If the "*all" literal fails to reach
+        the model, ``requested_fields`` degrades into a plain list and every
+        field is filtered out of the output.
+        """
+        issues_mixin.jira.get_issue.return_value = make_issue_data(
+            customfield_10049="Custom value"
+        )
+
+        issue = issues_mixin.get_issue(
+            "TEST-123", fields=fields, expand="renderedFields"
+        )
+
+        assert issues_mixin.jira.get_issue.call_args.kwargs["fields"] == "*all"
+        assert issue.requested_fields == "*all"
+        simplified = issue.to_simplified_dict()
+        for expected in ("summary", "status", "description", "assignee"):
+            assert expected in simplified, (
+                f"{expected} missing from {sorted(simplified)}"
+            )
+        assert "customfield_10049" in simplified
+
+    def test_get_issue_rendered_fields_with_default_fields(
+        self, issues_mixin: IssuesMixin, make_issue_data: Any
+    ) -> None:
+        """Test rendered is added to the default field set without reordering it.
+
+        Appending ``rendered`` for the default field set is long-standing
+        behaviour and is kept as-is; it is deliberately not extended to
+        caller-supplied field sets.
+        """
+        issues_mixin.jira.get_issue.return_value = make_issue_data()
+        issues_mixin.get_issue("TEST-123")
+        baseline = issues_mixin.jira.get_issue.call_args.kwargs["fields"].split(",")
+
+        issues_mixin.jira.get_issue.reset_mock()
+        issues_mixin.jira.get_issue.return_value = make_issue_data()
+        issues_mixin.get_issue("TEST-123", expand="renderedFields")
+        expanded = issues_mixin.jira.get_issue.call_args.kwargs["fields"].split(",")
+
+        default_count = len(DEFAULT_READ_JIRA_FIELDS)
+        assert expanded[:default_count] == baseline[:default_count]
+        assert "rendered" in expanded
+        assert set(expanded) == set(baseline) | {"rendered"}
+
+    @pytest.mark.parametrize("fields", [None, "summary,description", "*all"])
+    @pytest.mark.parametrize("expand", [None, "changelog", "transitions"])
+    def test_get_issue_without_rendered_expand_skips_rendered(
+        self,
+        issues_mixin: IssuesMixin,
+        make_issue_data: Any,
+        fields: str | None,
+        expand: str | None,
+    ) -> None:
+        """Test rendered is never requested unless renderedFields is expanded."""
+        issues_mixin.jira.get_issue.return_value = make_issue_data()
+
+        issues_mixin.get_issue("TEST-123", fields=fields, expand=expand)
+
+        sent_fields = issues_mixin.jira.get_issue.call_args.kwargs["fields"]
+        assert "rendered" not in sent_fields.split(",")
+
+    def test_get_issue_surfaces_rendered_fields_payload(
+        self, issues_mixin: IssuesMixin, make_issue_data: Any
+    ) -> None:
+        """Test the renderedFields payload reaches the model and its output."""
+        rendered = {"description": "<p>Rendered description</p>"}
+        issues_mixin.jira.get_issue.return_value = {
+            **make_issue_data(),
+            "renderedFields": rendered,
+        }
+
+        issue = issues_mixin.get_issue(
+            "TEST-123", fields="summary,description", expand="renderedFields"
+        )
+
+        assert issue.rendered_fields == rendered
+        assert issue.to_simplified_dict()["rendered_fields"] == rendered
+
+    @pytest.mark.parametrize(
+        ("fields", "expected"),
+        [
+            ("summary,", "summary"),
+            ("summary, description", "summary,description"),
+            (" summary , description ", "summary,description"),
+            (["summary", ""], "summary"),
+        ],
+        ids=["trailing-comma", "inner-space", "outer-space", "empty-list-entry"],
+    )
+    def test_get_issue_never_sends_an_empty_field_entry(
+        self,
+        issues_mixin: IssuesMixin,
+        make_issue_data: Any,
+        fields: Any,
+        expected: str,
+    ) -> None:
+        """Test blank field entries are dropped instead of forwarded.
+
+        Some Jira deployments reject a ``fields`` parameter that contains an
+        empty entry next to a real one.
+        """
+        issues_mixin.jira.get_issue.return_value = make_issue_data()
+
+        issues_mixin.get_issue("TEST-123", fields=fields, expand="renderedFields")
+
+        assert issues_mixin.jira.get_issue.call_args.kwargs["fields"] == expected
+
+    def test_get_issue_rendered_payload_needs_no_rendered_field(
+        self, issues_mixin: IssuesMixin, make_issue_data: Any
+    ) -> None:
+        """Test rendered content surfaces without a 'rendered' entry in fields.
+
+        The payload is read from the response's ``renderedFields`` object, which
+        Jira returns because of ``expand``, not because of the fields parameter.
+        """
+        rendered = {"description": "<p>Rendered description</p>"}
+        issues_mixin.jira.get_issue.return_value = {
+            **make_issue_data(),
+            "renderedFields": rendered,
+        }
+
+        issue = issues_mixin.get_issue(
+            "TEST-123", fields="*all", expand="renderedFields"
+        )
+
+        sent_fields = issues_mixin.jira.get_issue.call_args.kwargs["fields"]
+        assert "rendered" not in sent_fields.split(",")
+        assert issue.to_simplified_dict()["rendered_fields"] == rendered
 
     def test_get_issue_with_properties(
         self, issues_mixin: IssuesMixin, make_issue_data
