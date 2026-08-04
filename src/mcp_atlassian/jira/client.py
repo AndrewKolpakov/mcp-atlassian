@@ -35,6 +35,41 @@ from .config import JiraConfig, normalize_project_key
 logger = logging.getLogger("mcp-jira")
 
 
+def _parse_known_project_keys(projects_filter: str | None) -> set[str] | None:
+    """Parse a configured projects filter into an allowlist of project keys.
+
+    Used to scope bare-issue-key auto-linking in ADF output, so that prose
+    such as "PR-1 .. PR-17" is not turned into dead ``/browse/`` links for
+    projects that do not exist. No API call is made: the answer comes purely
+    from configuration.
+
+    ``JIRA_PROJECTS_FILTER`` is read exactly as every other consumer of it reads
+    it — comma-separated — so that one setting cannot come to mean two different
+    things. A value the search filter treats as a single key must not be split
+    into several keys here.
+
+    Args:
+        projects_filter: Raw ``JIRA_PROJECTS_FILTER`` value, i.e. comma-separated
+            project keys in any case, with surrounding whitespace and blank
+            entries tolerated. Anything that is not a string is treated as
+            absent.
+
+    Returns:
+        Upper-cased project keys, or None when no usable key is configured.
+        None preserves the historical behavior of linking every
+        issue-key-shaped token.
+    """
+    if not isinstance(projects_filter, str):
+        return None
+
+    keys = {
+        normalized
+        for part in projects_filter.split(",")
+        if (normalized := normalize_project_key(part))
+    }
+    return keys or None
+
+
 class JiraClient:
     """Base client for Jira API interactions."""
 
@@ -309,6 +344,11 @@ class JiraClient:
     def _markdown_to_jira(self, markdown_text: str) -> str | dict[str, Any]:
         """Convert Markdown to Jira format (ADF for Cloud, wiki markup for Server).
 
+        On Cloud, bare issue keys are auto-linked. When
+        ``JIRA_PROJECTS_FILTER`` is configured, only keys belonging to those
+        projects are linked, which keeps issue-key-shaped prose (part numbers,
+        "PR-3", standards) from becoming dead links.
+
         Args:
             markdown_text: Text in Markdown format
 
@@ -320,7 +360,13 @@ class JiraClient:
 
         if self.config.is_cloud:
             try:
-                return markdown_to_adf(markdown_text, jira_base_url=self.config.url)
+                return markdown_to_adf(
+                    markdown_text,
+                    jira_base_url=self.config.url,
+                    known_project_keys=_parse_known_project_keys(
+                        self.config.projects_filter
+                    ),
+                )
             except Exception as e:
                 logger.warning(f"Error converting markdown to ADF: {e}")
                 return {

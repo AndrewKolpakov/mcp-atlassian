@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 from requests.sessions import Session
 
-from mcp_atlassian.jira.client import JiraClient
+from mcp_atlassian.jira.client import JiraClient, _parse_known_project_keys
 from mcp_atlassian.jira.config import JiraConfig
 from mcp_atlassian.utils.ssl import NoProxyAdapter
 
@@ -712,3 +712,33 @@ def test_update_version_rejects_non_dict_response() -> None:
 
         with pytest.raises(ValueError, match="Unexpected response from Jira API"):
             client.update_version("10001", released=True)
+
+
+@pytest.mark.parametrize(
+    ("projects_filter", "expected"),
+    [
+        pytest.param("PROJ", {"PROJ"}, id="single-key"),
+        pytest.param("PROJ,OTHER", {"PROJ", "OTHER"}, id="comma-separated"),
+        pytest.param(" proj , other ", {"PROJ", "OTHER"}, id="padded-and-lowercase"),
+        pytest.param("PROJ,,OTHER,", {"PROJ", "OTHER"}, id="blank-entries-dropped"),
+        pytest.param(None, None, id="unset"),
+        pytest.param("", None, id="empty"),
+        pytest.param("  ,  ", None, id="only-blank-entries"),
+        pytest.param(["PROJ"], None, id="not-a-string"),
+    ],
+)
+def test_parse_known_project_keys(projects_filter, expected) -> None:
+    """The auto-link allowlist reads JIRA_PROJECTS_FILTER as comma-separated."""
+    assert _parse_known_project_keys(projects_filter) == expected
+
+
+def test_parse_known_project_keys_does_not_split_on_whitespace() -> None:
+    """A whitespace-separated value stays one key, as the search filter reads it.
+
+    `JiraSearchMixin._and_projects_filter` and
+    `JiraConfig._parse_internal_only_projects` both split this setting on commas
+    only, so "PROJ OTHER" is a single (bogus) key to them. Splitting it into two
+    keys here would make one setting mean two different things: prose would be
+    auto-linked for projects the search filter never actually allows.
+    """
+    assert _parse_known_project_keys("PROJ OTHER") == {"PROJ OTHER"}
