@@ -1127,12 +1127,27 @@ class TestMarkdownToAdf:
     def test_well_formed_tables_emit_no_column_count_warning(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Rectangular tables in either dialect log no warning."""
+        """Rectangular tables in either dialect log no *column-count* warning.
+
+        A wiki table still logs the conversion notice — that one fires for any
+        table carrying a wiki header row, by design, because translating a
+        dialect the writer does not otherwise speak is worth telling the
+        operator about. It is only the "mismatched column counts" clause of
+        that message that a rectangular table must not carry, and a Markdown
+        table must log nothing at all.
+        """
         with caplog.at_level(logging.WARNING):
             markdown_to_adf("| a | b |\n|---|---|\n| 1 | 2 |")
-            markdown_to_adf("||A||B||\n|1|2|")
+        assert caplog.records == []
 
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            markdown_to_adf("||A||B||\n|1|2|")
         assert self._column_count_warnings(caplog.records) == []
+        assert len(caplog.records) == 1
+        assert "Converted 1 Jira wiki markup table row(s)" in (
+            caplog.records[0].getMessage()
+        )
 
     def test_markdown_table_output_unchanged_by_wiki_support(self) -> None:
         """A well-formed Markdown table converts exactly as it did before."""
