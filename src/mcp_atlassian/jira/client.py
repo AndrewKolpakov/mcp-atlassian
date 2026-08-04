@@ -2,7 +2,6 @@
 
 import logging
 import os
-import re
 from typing import Any, Literal
 
 from atlassian import Jira
@@ -35,10 +34,6 @@ from .config import JiraConfig, normalize_project_key
 # Configure logging
 logger = logging.getLogger("mcp-jira")
 
-# Project keys in JIRA_PROJECTS_FILTER may be separated by commas and/or
-# whitespace, e.g. "PROJ, OTHER" or "PROJ OTHER".
-_PROJECTS_FILTER_SEPARATOR_RE = re.compile(r"[,\s]+")
-
 
 def _parse_known_project_keys(projects_filter: str | None) -> set[str] | None:
     """Parse a configured projects filter into an allowlist of project keys.
@@ -48,10 +43,16 @@ def _parse_known_project_keys(projects_filter: str | None) -> set[str] | None:
     projects that do not exist. No API call is made: the answer comes purely
     from configuration.
 
+    ``JIRA_PROJECTS_FILTER`` is read exactly as every other consumer of it reads
+    it — comma-separated — so that one setting cannot come to mean two different
+    things. A value the search filter treats as a single key must not be split
+    into several keys here.
+
     Args:
-        projects_filter: Raw ``JIRA_PROJECTS_FILTER`` value, i.e. project keys
-            separated by commas and/or whitespace, in any case. Anything that
-            is not a string is treated as absent.
+        projects_filter: Raw ``JIRA_PROJECTS_FILTER`` value, i.e. comma-separated
+            project keys in any case, with surrounding whitespace and blank
+            entries tolerated. Anything that is not a string is treated as
+            absent.
 
     Returns:
         Upper-cased project keys, or None when no usable key is configured.
@@ -63,7 +64,7 @@ def _parse_known_project_keys(projects_filter: str | None) -> set[str] | None:
 
     keys = {
         normalized
-        for part in _PROJECTS_FILTER_SEPARATOR_RE.split(projects_filter)
+        for part in projects_filter.split(",")
         if (normalized := normalize_project_key(part))
     }
     return keys or None

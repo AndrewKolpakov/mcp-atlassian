@@ -342,9 +342,11 @@ def markdown_to_adf(
         known_project_keys: Project keys that are known to exist. When given,
             only a bare issue key whose project prefix is in the set is
             auto-linked, so prose such as "PR-1 .. PR-17" is left as plain
-            text instead of gaining dead ``/browse/`` links. Keys are matched
-            case-insensitively. None (the default) links every
-            issue-key-shaped token.
+            text instead of gaining dead ``/browse/`` links. The allowlist
+            itself is case-insensitive — its entries are upper-cased before
+            comparison — but the text is not: only an upper-case key token is
+            recognised as an issue key in the first place. None (the default)
+            links every issue-key-shaped token.
 
     Returns:
         ADF document dict with version, type, and content keys.
