@@ -1034,3 +1034,260 @@ class TestDisplayNameMethods:
         sp = by_name["Story Points"]
         assert "name" not in sp
         assert sp["field_id"] == "customfield_10001"
+
+
+class TestEmptyCustomFieldFiltering:
+    """Empty custom fields must not pollute an all-fields response.
+
+    A ``*all`` request on a real Jira instance returns hundreds of custom
+    fields, nearly all of them empty. Those are dropped from the output while
+    ``custom_fields`` itself stays complete for the other consumers.
+    """
+
+    @pytest.fixture()
+    def api_data(self):
+        """API payload mixing empty, falsy-but-meaningful and populated fields."""
+        return {
+            "id": "500",
+            "key": "EMPTY-1",
+            "fields": {
+                "summary": "Empty custom field test",
+                "customfield_10011": None,
+                "customfield_10012": [],
+                "customfield_10013": "",
+                "customfield_10014": "   ",
+                "customfield_10015": {},
+                "customfield_10016": 0,
+                "customfield_10017": False,
+                "customfield_10018": "Populated",
+            },
+            "names": {
+                "customfield_10011": "Epic Name",
+                "customfield_10012": "Sprint",
+                "customfield_10013": "Notes",
+                "customfield_10014": "Blank",
+                "customfield_10015": "Empty Object",
+                "customfield_10016": "Story Points",
+                "customfield_10017": "Flagged",
+                "customfield_10018": "Team",
+            },
+        }
+
+    EMPTY_IDS = (
+        "customfield_10011",
+        "customfield_10012",
+        "customfield_10013",
+        "customfield_10014",
+        "customfield_10015",
+    )
+
+    # -- dropping ----------------------------------------------------------
+
+    def test_all_fields_drops_empty_custom_fields(self, api_data):
+        """None, empty list, blank string and empty object are all dropped."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
+
+        simplified = issue.to_simplified_dict()
+
+        for field_id in self.EMPTY_IDS:
+            assert field_id not in simplified, f"{field_id} should have been dropped"
+
+    def test_all_fields_keeps_populated_custom_fields(self, api_data):
+        """Dropping empties must not touch fields that carry a value."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
+
+        simplified = issue.to_simplified_dict()
+
+        assert simplified["customfield_10018"] == {
+            "value": "Populated",
+            "name": "Team",
+        }
+
+    @pytest.mark.parametrize(
+        ("field_id", "expected_value"),
+        [("customfield_10016", 0), ("customfield_10017", False)],
+    )
+    def test_falsy_but_meaningful_values_are_kept(
+        self, api_data, field_id, expected_value
+    ):
+        """Zero and False are real values, not emptiness."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
+
+        simplified = issue.to_simplified_dict()
+
+        assert field_id in simplified
+        assert simplified[field_id]["value"] == expected_value
+        assert simplified[field_id]["value"] is expected_value
+
+    def test_display_name_dict_drops_empty_custom_fields(self, api_data):
+        """jira_get_issue / jira_search return to_display_name_dict output."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
+
+        display = issue.to_display_name_dict()
+
+        assert "Epic Name" not in display
+        assert "Sprint" not in display
+        assert display["Team"]["value"] == "Populated"
+
+    # -- explicitly requested fields are exempt ----------------------------
+
+    def test_explicitly_requested_null_is_kept(self, api_data):
+        """A field asked for by id is reported even when it is null."""
+        issue = JiraIssue.from_api_response(
+            api_data, requested_fields="summary,customfield_10011"
+        )
+
+        simplified = issue.to_simplified_dict()
+
+        assert simplified["customfield_10011"] == {
+            "value": None,
+            "name": "Epic Name",
+        }
+
+    def test_explicitly_requested_empty_list_is_kept_by_display_name(self, api_data):
+        """A field asked for by display name is reported even when empty."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields=["Sprint"])
+
+        simplified = issue.to_simplified_dict()
+
+        assert simplified["customfield_10012"] == {"value": [], "name": "Sprint"}
+
+    def test_explicitly_requested_empty_string_is_kept_via_cf_alias(self, api_data):
+        """The ``cf_XXXXX`` alias is an explicit request too."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields=["cf_10013"])
+
+        simplified = issue.to_simplified_dict()
+
+        assert simplified["customfield_10013"] == {"value": "", "name": "Notes"}
+
+    # -- custom_fields itself stays complete -------------------------------
+
+    def test_custom_fields_dict_keeps_empty_entries(self, api_data):
+        """The stored dict is the source of truth and is never filtered."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
+
+        issue.to_simplified_dict()
+
+        for field_id in self.EMPTY_IDS:
+            assert field_id in issue.custom_fields
+
+    def test_to_simplified_dict_does_not_mutate_custom_fields(self, api_data):
+        """Two consecutive calls must see the same stored fields."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
+
+        before = dict(issue.custom_fields)
+        first = issue.to_simplified_dict()
+        second = issue.to_simplified_dict()
+
+        assert issue.custom_fields == before
+        assert first == second
+
+    def test_attribute_access_to_empty_custom_field_still_works(self, api_data):
+        """``issue.customfield_10011`` falls back to custom_fields."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
+
+        issue.to_simplified_dict()
+
+        assert issue.customfield_10011 == {"value": None, "name": "Epic Name"}
+
+    def test_custom_fields_by_display_name_keeps_empty_entries(self, api_data):
+        """The display-name view reads custom_fields directly, unfiltered."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
+
+        by_name = issue.custom_fields_by_display_name
+
+        assert by_name["Epic Name"] == {
+            "value": None,
+            "field_id": "customfield_10011",
+        }
+
+    def test_find_custom_field_in_issue_still_finds_empty_field(self, api_data):
+        """Epic lookups walk custom_fields and must still see empty fields."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
+
+        field_id, field_value = issue._find_custom_field_in_issue("Sprint")
+
+        assert field_id == "customfield_10012"
+        assert field_value == {"value": [], "name": "Sprint"}
+
+    # -- the non-prefixed sentinel key -------------------------------------
+
+    # The shape jira/issues.py stores under the "attachment_results" key,
+    # i.e. the return value of upload_attachments().
+    SENTINEL_VALUE = {
+        "success": True,
+        "issue_key": "EMPTY-1",
+        "total": 1,
+        "uploaded": [{"filename": "photo.png", "size": 12, "id": "1"}],
+        "failed": [],
+    }
+
+    @pytest.mark.parametrize(
+        "sentinel",
+        [SENTINEL_VALUE, [{"filename": "photo.png", "status": "uploaded"}]],
+        ids=["upload_summary_dict", "list_payload"],
+    )
+    def test_attachment_results_sentinel_is_not_dropped(self, api_data, sentinel):
+        """``update_issue`` stores a non-prefixed key in custom_fields."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
+        issue.custom_fields["attachment_results"] = sentinel
+
+        simplified = issue.to_simplified_dict()
+
+        assert simplified["attachment_results"] == sentinel
+
+    def test_sentinel_does_not_break_display_name_requests(self, api_data):
+        """The sentinel entry must not derail a display-name lookup."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields=["Team"])
+        issue.custom_fields["attachment_results"] = self.SENTINEL_VALUE
+
+        simplified = issue.to_simplified_dict()
+
+        assert simplified["customfield_10018"] == {
+            "value": "Populated",
+            "name": "Team",
+        }
+
+    # -- requested_fields normalization ------------------------------------
+
+    def test_comma_joined_entry_inside_a_list_is_split(self, api_data):
+        """``["a,b"]`` must select two fields, not zero."""
+        issue = JiraIssue.from_api_response(
+            api_data, requested_fields=["customfield_10011,customfield_10018"]
+        )
+
+        simplified = issue.to_simplified_dict()
+
+        assert simplified["customfield_10011"] == {
+            "value": None,
+            "name": "Epic Name",
+        }
+        assert simplified["customfield_10018"]["value"] == "Populated"
+
+    def test_all_marker_inside_a_list_behaves_like_all(self, api_data):
+        """``["*all"]`` must mean every field, with empties still dropped."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields=["*all"])
+
+        assert issue.requested_fields == "*all"
+
+        simplified = issue.to_simplified_dict()
+
+        assert simplified["customfield_10018"]["value"] == "Populated"
+        assert "customfield_10011" not in simplified
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            (None, None),
+            ("*all", "*all"),
+            ("summary, status", ["summary", "status"]),
+            (["summary,status"], ["summary", "status"]),
+            (["*all"], "*all"),
+            (["summary", "*all"], "*all"),
+            (("summary", "status"), ["summary", "status"]),
+            ("", []),
+        ],
+    )
+    def test_normalize_requested_fields(self, raw, expected):
+        """The selector is canonicalised before it reaches the model."""
+        assert JiraIssue._normalize_requested_fields(raw) == expected
