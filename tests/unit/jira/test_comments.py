@@ -503,6 +503,33 @@ class TestCommentsMixin:
             link_mark["attrs"]["href"] == "https://test.atlassian.net/browse/PROJ-123"
         )
 
+    def test_markdown_to_jira_cloud_scopes_links_to_projects_filter(
+        self, jira_config_factory
+    ):
+        """A configured projects filter reaches the ADF writer.
+
+        Regression test: issue-key-shaped prose such as "PR-1 .. PR-17" used to
+        become dead /browse/ links for projects that do not exist.
+        """
+        config = jira_config_factory(projects_filter=" proj , other ")
+        mixin = CommentsMixin(config=config)
+        mixin.jira = Mock()
+        mixin.preprocessor = Mock()
+
+        result = mixin._markdown_to_jira(
+            "Blocked by PROJ-123, part of the PR-1 .. PR-17 series."
+        )
+
+        nodes = result["content"][0]["content"]
+        linked = {
+            node["text"]
+            for node in nodes
+            if any(mark["type"] == "link" for mark in node.get("marks", []))
+        }
+        assert linked == {"PROJ-123"}
+        assert any("PR-1 .. PR-17" in node["text"] for node in nodes)
+        mixin.preprocessor.markdown_to_jira.assert_not_called()
+
     def test_markdown_to_jira_cloud_empty(self, comments_mixin):
         """Test _markdown_to_jira with empty text on Cloud returns ADF."""
         result = comments_mixin._markdown_to_jira("")

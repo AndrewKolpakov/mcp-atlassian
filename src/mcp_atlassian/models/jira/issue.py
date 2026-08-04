@@ -92,6 +92,7 @@ class JiraIssue(ApiModel, TimestampMixin):
     worklog: dict | None = None
     changelogs: list[JiraChangelog] = Field(default_factory=list)
     issuelinks: list[JiraIssueLink] = Field(default_factory=list)
+    rendered_fields: dict[str, Any] | None = None
 
     def __getattribute__(self, name: str) -> Any:
         """
@@ -424,6 +425,12 @@ class JiraIssue(ApiModel, TimestampMixin):
                 for history in changelogs_data["histories"]
             ]
 
+        # Handling rendered fields (only returned for expand=renderedFields)
+        rendered_fields_data = data.get("renderedFields")
+        rendered_fields = (
+            rendered_fields_data if isinstance(rendered_fields_data, dict) else None
+        )
+
         # Handling attachments
         attachments = []
         attachments_data = fields.get("attachment", [])
@@ -471,7 +478,10 @@ class JiraIssue(ApiModel, TimestampMixin):
                     value_obj_to_store["name"] = human_readable_name
                 custom_fields[orig_field_id] = value_obj_to_store
 
-        # Handle requested_fields parameter
+        # Handle requested_fields parameter. Both sides of this merge normalized
+        # the selector; _normalize_requested_fields is the general form -- it
+        # drops blank entries and honours "*all" wherever it appears, including
+        # inside a list, which the inlined version only did for a lone entry.
         requested_fields_param = cls._normalize_requested_fields(
             kwargs.get("requested_fields")
         )
@@ -513,6 +523,7 @@ class JiraIssue(ApiModel, TimestampMixin):
             requested_fields=requested_fields_param,
             changelogs=changelogs,
             issuelinks=cls._extract_issue_links(fields),
+            rendered_fields=rendered_fields,
         )
 
     @staticmethod
@@ -690,6 +701,12 @@ class JiraIssue(ApiModel, TimestampMixin):
             result["changelogs"] = [
                 changelog.to_simplified_dict() for changelog in self.changelogs
             ]
+
+        # Do not gate this on should_include_field: rendered fields are present
+        # only when the caller asked for them via expand=renderedFields, which
+        # is a separate request from naming a field in `fields`.
+        if self.rendered_fields:
+            result["rendered_fields"] = self.rendered_fields
 
         # Add issue links if available and requested
         if self.issuelinks and should_include_field("issuelinks"):
