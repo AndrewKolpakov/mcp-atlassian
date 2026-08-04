@@ -1037,11 +1037,17 @@ class TestDisplayNameMethods:
 
 
 class TestEmptyCustomFieldFiltering:
-    """Empty custom fields must not pollute an all-fields response.
+    """Null custom fields must not pollute an all-fields response.
 
     A ``*all`` request on a real Jira instance returns hundreds of custom
-    fields, nearly all of them empty. Those are dropped from the output while
-    ``custom_fields`` itself stays complete for the other consumers.
+    fields, nearly all of them reported as ``null``. Those are dropped from the
+    output while ``custom_fields`` itself stays complete for the other
+    consumers.
+
+    The rule is deliberately narrow: **only** ``None`` is dropped. A blank
+    string or an empty list is not "no value", it is a value somebody set - a
+    cleared text field, a deliberately emptied multi-select - and hiding it
+    would hide real issue state.
     """
 
     @pytest.fixture()
@@ -1073,8 +1079,11 @@ class TestEmptyCustomFieldFiltering:
             },
         }
 
-    EMPTY_IDS = (
-        "customfield_10011",
+    # Fields Jira reports as having no value at all.
+    NULL_IDS = ("customfield_10011",)
+
+    # Fields that hold an empty value somebody set. Not the same thing.
+    EMPTY_BUT_SET_IDS = (
         "customfield_10012",
         "customfield_10013",
         "customfield_10014",
@@ -1083,17 +1092,47 @@ class TestEmptyCustomFieldFiltering:
 
     # -- dropping ----------------------------------------------------------
 
-    def test_all_fields_drops_empty_custom_fields(self, api_data):
-        """None, empty list, blank string and empty object are all dropped."""
+    def test_all_fields_drops_null_custom_fields(self, api_data):
+        """A field Jira reports as ``null`` is omitted from ``*all`` output."""
         issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
 
         simplified = issue.to_simplified_dict()
 
-        for field_id in self.EMPTY_IDS:
+        for field_id in self.NULL_IDS:
             assert field_id not in simplified, f"{field_id} should have been dropped"
 
+    @pytest.mark.parametrize(
+        ("field_id", "expected_value", "field_name"),
+        [
+            ("customfield_10012", [], "Sprint"),
+            ("customfield_10013", "", "Notes"),
+            ("customfield_10014", "   ", "Blank"),
+            ("customfield_10015", {}, "Empty Object"),
+        ],
+        ids=["empty_list", "empty_string", "whitespace_string", "empty_object"],
+    )
+    def test_all_fields_keeps_values_that_are_merely_empty(
+        self, api_data, field_id, expected_value, field_name
+    ):
+        """Only ``null`` is dropped - an emptied value is still a value.
+
+        This pins the deliberate choice to filter on ``is None`` alone. An
+        empty string or empty list is what a human leaves behind when they
+        clear a text field or empty a multi-select, and the caller must be able
+        to see that state instead of it looking like the field was never set.
+        """
+        issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
+
+        simplified = issue.to_simplified_dict()
+
+        assert field_id in simplified, f"{field_id} should have survived"
+        assert simplified[field_id] == {
+            "value": expected_value,
+            "name": field_name,
+        }
+
     def test_all_fields_keeps_populated_custom_fields(self, api_data):
-        """Dropping empties must not touch fields that carry a value."""
+        """Dropping nulls must not touch fields that carry a value."""
         issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
 
         simplified = issue.to_simplified_dict()
@@ -1119,14 +1158,15 @@ class TestEmptyCustomFieldFiltering:
         assert simplified[field_id]["value"] == expected_value
         assert simplified[field_id]["value"] is expected_value
 
-    def test_display_name_dict_drops_empty_custom_fields(self, api_data):
+    def test_display_name_dict_drops_only_null_custom_fields(self, api_data):
         """jira_get_issue / jira_search return to_display_name_dict output."""
         issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
 
         display = issue.to_display_name_dict()
 
         assert "Epic Name" not in display
-        assert "Sprint" not in display
+        assert display["Sprint"]["value"] == []
+        assert display["Notes"]["value"] == ""
         assert display["Team"]["value"] == "Populated"
 
     # -- explicitly requested fields are exempt ----------------------------
@@ -1168,7 +1208,7 @@ class TestEmptyCustomFieldFiltering:
 
         issue.to_simplified_dict()
 
-        for field_id in self.EMPTY_IDS:
+        for field_id in self.NULL_IDS + self.EMPTY_BUT_SET_IDS:
             assert field_id in issue.custom_fields
 
     def test_to_simplified_dict_does_not_mutate_custom_fields(self, api_data):
@@ -1265,7 +1305,7 @@ class TestEmptyCustomFieldFiltering:
         assert simplified["customfield_10018"]["value"] == "Populated"
 
     def test_all_marker_inside_a_list_behaves_like_all(self, api_data):
-        """``["*all"]`` must mean every field, with empties still dropped."""
+        """``["*all"]`` must mean every field, with nulls still dropped."""
         issue = JiraIssue.from_api_response(api_data, requested_fields=["*all"])
 
         assert issue.requested_fields == "*all"

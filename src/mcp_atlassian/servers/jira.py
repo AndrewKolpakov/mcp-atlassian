@@ -583,9 +583,10 @@ async def get_issue(
             description=(
                 "(Optional) Comma-separated list of fields to return (e.g., 'summary,status,customfield_10010'). "
                 "You may also provide a single field as a string (e.g., 'duedate'). "
-                "Use '*all' for all fields (including custom fields; empty custom "
-                "fields are omitted), or omit for essential fields only. "
-                "Name a custom field explicitly to see it even when it is empty."
+                "Use '*all' for all fields (including custom fields; custom "
+                "fields Jira reports as empty (null) are omitted), or omit for "
+                "essential fields only. Name a custom field explicitly to see "
+                "it even when it is null."
             ),
             default=",".join(DEFAULT_READ_JIRA_FIELDS),
         ),
@@ -772,8 +773,8 @@ async def search(
         Field(
             description=(
                 "(Optional) Comma-separated fields to return in the results. "
-                "Use '*all' for all fields (empty custom fields are omitted), "
-                "or specify individual fields like "
+                "Use '*all' for all fields (custom fields Jira reports as "
+                "empty (null) are omitted), or specify individual fields like "
                 "'summary,status,assignee,priority'"
             ),
             default=",".join(DEFAULT_READ_JIRA_FIELDS),

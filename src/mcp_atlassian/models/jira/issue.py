@@ -704,26 +704,24 @@ class JiraIssue(ApiModel, TimestampMixin):
 
     @staticmethod
     def _is_empty_custom_field_value(value: Any) -> bool:
-        """Report whether a processed custom-field value carries no information.
+        """Report whether Jira reports this custom field as having no value.
 
-        ``0``, ``False`` and other falsy scalars are meaningful field values
-        and are therefore **not** treated as empty.
+        Only ``None`` counts as empty, which is what "absent" means everywhere
+        else here: :meth:`to_simplified_dict` ends by dropping ``None`` entries
+        and :meth:`_process_custom_field_value` passes ``None`` straight
+        through. A blank string or an empty container is a value somebody
+        actually set - a cleared text field, a deliberately emptied
+        multi-select - and ``0``, ``False`` and other falsy scalars are
+        meaningful field values, so none of those are treated as empty.
 
         Args:
             value: A value already passed through
                 :meth:`_process_custom_field_value`.
 
         Returns:
-            True when the value is ``None``, a blank string or an empty
-            container, otherwise False.
+            True when the value is ``None``, otherwise False.
         """
-        if value is None:
-            return True
-        if isinstance(value, str):
-            return not value.strip()
-        if isinstance(value, list | tuple | set | dict):
-            return len(value) == 0
-        return False
+        return value is None
 
     def _build_custom_field_output(self, field_data: dict[str, Any]) -> dict[str, Any]:
         """Build the output object for one stored custom field.
@@ -746,11 +744,13 @@ class JiraIssue(ApiModel, TimestampMixin):
     def _collect_custom_fields_for_output(self) -> dict[str, Any]:
         """Build the custom-field section of :meth:`to_simplified_dict`.
 
-        When every field was requested (``"*all"``), custom fields whose value
-        carries no information are omitted: an all-fields response is
-        otherwise dominated by empty fields. A field named explicitly in
-        ``requested_fields`` is always emitted, even when empty, so callers can
-        tell "this field is empty" apart from "this field is not on the issue".
+        When every field was requested (``"*all"``), custom fields Jira reports
+        as ``null`` are omitted: an all-fields response is otherwise dominated
+        by fields the issue never had a value for. Nothing else is dropped - a
+        blank string or an empty list is a value somebody set. A field named
+        explicitly in ``requested_fields`` is always emitted, even when
+        ``null``, so callers can tell "this field is empty" apart from "this
+        field is not on the issue".
 
         ``custom_fields`` itself is never filtered or mutated here - attribute
         access (``issue.customfield_10011``), ``custom_fields_by_display_name``
