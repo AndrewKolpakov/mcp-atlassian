@@ -670,8 +670,9 @@ class JiraIssue(ApiModel, TimestampMixin):
                 changelog.to_simplified_dict() for changelog in self.changelogs
             ]
 
-        # Not use should_include_field since rendered fields are only present
-        # when the caller asks for them via expand=renderedFields
+        # Do not gate this on should_include_field: rendered fields are present
+        # only when the caller asked for them via expand=renderedFields, which
+        # is a separate request from naming a field in `fields`.
         if self.rendered_fields:
             result["rendered_fields"] = self.rendered_fields
 
