@@ -568,6 +568,72 @@ class TestMarkdownToAdf:
         else:
             assert not link_marks
 
+    @staticmethod
+    def _linked_texts(nodes: list[dict[str, Any]]) -> set[str]:
+        """Collect the text of every node carrying a link mark."""
+        return {
+            node["text"]
+            for node in nodes
+            if any(mark["type"] == "link" for mark in node.get("marks", []))
+        }
+
+    def test_known_project_keys_scopes_issue_key_links(self) -> None:
+        """Only keys of known projects are linked; other tokens stay plain text."""
+        text = "Tracked in PLOOP-12466. Sequence PR-1 .. PR-17."
+        result = markdown_to_adf(
+            text,
+            jira_base_url="https://jira.example.com",
+            known_project_keys={"PLOOP"},
+        )
+        nodes = result["content"][0]["content"]
+
+        assert self._linked_texts(nodes) == {"PLOOP-12466"}
+        # Nothing is dropped: the unknown keys survive as literal text.
+        assert "".join(node["text"] for node in nodes) == text
+        pr_node = next(node for node in nodes if "PR-1" in node["text"])
+        assert pr_node.get("marks", []) == []
+
+    def test_issue_key_links_stay_unscoped_by_default(self) -> None:
+        """Omitting the allowlist keeps the historical link-everything behavior."""
+        result = markdown_to_adf(
+            "Tracked in PLOOP-12466. Sequence PR-1 .. PR-17.",
+            jira_base_url="https://jira.example.com",
+        )
+        nodes = result["content"][0]["content"]
+
+        assert self._linked_texts(nodes) == {"PLOOP-12466", "PR-1", "PR-17"}
+
+    @pytest.mark.parametrize("configured_key", ["ploop", "  PLOOP  ", "\tPlOoP\n"])
+    def test_known_project_keys_ignore_case_and_padding(
+        self, configured_key: str
+    ) -> None:
+        """A lower-case or whitespace-padded project key still matches."""
+        result = markdown_to_adf(
+            "Tracked in PLOOP-12466 and PR-1.",
+            jira_base_url="https://jira.example.com",
+            known_project_keys={configured_key},
+        )
+        nodes = result["content"][0]["content"]
+
+        assert self._linked_texts(nodes) == {"PLOOP-12466"}
+
+    def test_known_project_keys_apply_inside_inline_formatting(self) -> None:
+        """The allowlist also scopes keys inside bold text and list items."""
+        result = markdown_to_adf(
+            "**PLOOP-12466 blocks PR-1**\n\n- PLOOP-12466 and PR-17",
+            jira_base_url="https://jira.example.com",
+            known_project_keys={"PLOOP"},
+        )
+        bold_nodes = result["content"][0]["content"]
+        item_nodes = result["content"][1]["content"][0]["content"][0]["content"]
+
+        assert all(
+            any(mark["type"] == "strong" for mark in node["marks"])
+            for node in bold_nodes
+        )
+        assert self._linked_texts(bold_nodes) == {"PLOOP-12466"}
+        assert self._linked_texts(item_nodes) == {"PLOOP-12466"}
+
     # -- Code blocks --------------------------------------------------------
 
     def test_code_block_with_lang(self):
