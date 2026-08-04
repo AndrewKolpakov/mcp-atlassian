@@ -92,6 +92,7 @@ class JiraIssue(ApiModel, TimestampMixin):
     worklog: dict | None = None
     changelogs: list[JiraChangelog] = Field(default_factory=list)
     issuelinks: list[JiraIssueLink] = Field(default_factory=list)
+    rendered_fields: dict[str, Any] | None = None
 
     def __getattribute__(self, name: str) -> Any:
         """
@@ -424,6 +425,12 @@ class JiraIssue(ApiModel, TimestampMixin):
                 for history in changelogs_data["histories"]
             ]
 
+        # Handling rendered fields (only returned for expand=renderedFields)
+        rendered_fields_data = data.get("renderedFields")
+        rendered_fields = (
+            rendered_fields_data if isinstance(rendered_fields_data, dict) else None
+        )
+
         # Handling attachments
         attachments = []
         attachments_data = fields.get("attachment", [])
@@ -474,11 +481,17 @@ class JiraIssue(ApiModel, TimestampMixin):
         # Handle requested_fields parameter
         requested_fields_param = kwargs.get("requested_fields")
 
-        # Convert string requested_fields to list (except "*all")
+        # Convert string requested_fields to list (except "*all"). Blank entries
+        # are dropped and a lone "*all" entry collapses back to the literal so
+        # that spellings such as "*all " keep meaning "every field" instead of
+        # filtering every field out of to_simplified_dict().
         if isinstance(requested_fields_param, str) and requested_fields_param != "*all":
-            requested_fields_param = requested_fields_param.split(",")
-            # Strip whitespace from each field name
-            requested_fields_param = [field.strip() for field in requested_fields_param]
+            entries = [
+                field.strip()
+                for field in requested_fields_param.split(",")
+                if field.strip()
+            ]
+            requested_fields_param = "*all" if entries == ["*all"] else entries
 
         # Create the issue instance with all the extracted data
         return cls(
@@ -517,6 +530,7 @@ class JiraIssue(ApiModel, TimestampMixin):
             requested_fields=requested_fields_param,
             changelogs=changelogs,
             issuelinks=cls._extract_issue_links(fields),
+            rendered_fields=rendered_fields,
         )
 
     def to_simplified_dict(self) -> dict[str, Any]:
@@ -655,6 +669,12 @@ class JiraIssue(ApiModel, TimestampMixin):
             result["changelogs"] = [
                 changelog.to_simplified_dict() for changelog in self.changelogs
             ]
+
+        # Do not gate this on should_include_field: rendered fields are present
+        # only when the caller asked for them via expand=renderedFields, which
+        # is a separate request from naming a field in `fields`.
+        if self.rendered_fields:
+            result["rendered_fields"] = self.rendered_fields
 
         # Add issue links if available and requested
         if self.issuelinks and should_include_field("issuelinks"):

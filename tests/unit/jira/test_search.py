@@ -53,6 +53,34 @@ class TestSearchMixin:
             "maxResults": 50,
         }
 
+    @pytest.mark.parametrize(
+        "fields",
+        ["*all", "*all ", "*all,", ["*all"]],
+        ids=["bare", "trailing-space", "trailing-comma", "list"],
+    )
+    def test_search_issues_all_fields_keeps_every_field(
+        self,
+        search_mixin: SearchMixin,
+        mock_issues_response,
+        fields: Any,
+    ):
+        """Test every "*all" spelling returns whole issues from a search.
+
+        ``search_issues`` forwards its fields parameter to the model as
+        ``requested_fields`` verbatim, so a spelling such as ``"*all "`` must
+        still mean "every field" rather than collapsing each result to
+        ``id``/``key``.
+        """
+        search_mixin.jira.jql = MagicMock(return_value=mock_issues_response)
+
+        result = search_mixin.search_issues("project = TEST", fields=fields)
+
+        simplified = result.issues[0].to_simplified_dict()
+        for expected in ("summary", "status", "description"):
+            assert expected in simplified, (
+                f"{expected} missing from {sorted(simplified)}"
+            )
+
     def test_search_issues_calls_v3_api_for_cloud(
         self,
         search_mixin: SearchMixin,
