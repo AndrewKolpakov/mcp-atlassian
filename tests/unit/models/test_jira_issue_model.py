@@ -5,6 +5,7 @@ Tests for the JiraIssue model including custom field handling,
 epic field extraction, and simplified dict conversion.
 """
 
+import json
 import re
 
 import pytest
@@ -300,6 +301,81 @@ class TestJiraIssue:
 
         assert issue.environment == "Cloud ADF"
         assert issue.to_simplified_dict()["environment"] == "Cloud ADF"
+
+    def test_from_api_response_surfaces_rendered_fields(self, jira_issue_data):
+        """Test that a ``renderedFields`` payload is parsed and surfaced."""
+        rendered = {
+            "description": "<p>Rendered description</p>",
+            "customfield_10049": "<b>Rendered custom field</b>",
+        }
+        issue = JiraIssue.from_api_response(
+            {**jira_issue_data, "renderedFields": rendered},
+            requested_fields="summary,description",
+        )
+
+        assert issue.rendered_fields == rendered
+        assert issue.to_simplified_dict()["rendered_fields"] == rendered
+
+    def test_to_simplified_dict_unchanged_without_rendered_fields(
+        self, jira_issue_data
+    ):
+        """Test the simplified dict only grows when rendered fields are returned."""
+        rendered = {"description": "<p>Rendered description</p>"}
+        without_rendered = JiraIssue.from_api_response(
+            jira_issue_data
+        ).to_simplified_dict()
+        with_rendered = JiraIssue.from_api_response(
+            {**jira_issue_data, "renderedFields": rendered}
+        ).to_simplified_dict()
+
+        assert "rendered_fields" not in without_rendered
+        assert with_rendered.pop("rendered_fields") == rendered
+        assert json.dumps(with_rendered) == json.dumps(without_rendered)
+
+    @pytest.mark.parametrize("rendered_value", [None, {}, "not-a-dict", []])
+    def test_rendered_fields_omitted_for_unusable_payload(
+        self, jira_issue_data, rendered_value
+    ):
+        """Test only a non-empty rendered fields mapping reaches the output."""
+        issue = JiraIssue.from_api_response(
+            {**jira_issue_data, "renderedFields": rendered_value}
+        )
+
+        assert "rendered_fields" not in issue.to_simplified_dict()
+
+    @pytest.mark.parametrize(
+        "requested_fields",
+        ["*all", "*all ", " *all", "*all,", " *all , "],
+        ids=["bare", "trailing-space", "leading-space", "trailing-comma", "both"],
+    )
+    def test_all_fields_spelling_keeps_every_field(
+        self, jira_issue_data, requested_fields
+    ):
+        """Test any "*all" spelling still selects every field.
+
+        ``requested_fields`` is declared as ``Literal["*all"] | list[str]``, so a
+        value like ``"*all "`` must collapse to the literal. Storing it as the
+        list ``["*all"]`` instead makes ``should_include_field`` reject every
+        field name and reduces the output to ``id``/``key``.
+        """
+        issue = JiraIssue.from_api_response(
+            jira_issue_data, requested_fields=requested_fields
+        )
+
+        assert issue.requested_fields == "*all"
+        simplified = issue.to_simplified_dict()
+        for expected in ("summary", "status", "description", "assignee"):
+            assert expected in simplified, (
+                f"{expected} missing from {sorted(simplified)}"
+            )
+
+    def test_blank_requested_field_entries_are_dropped(self, jira_issue_data):
+        """Test empty entries never reach the requested field list."""
+        issue = JiraIssue.from_api_response(
+            jira_issue_data, requested_fields="summary,,description, "
+        )
+
+        assert issue.requested_fields == ["summary", "description"]
 
     def test_from_api_response_builds_browse_url(self, jira_issue_data):
         """Test creating a browser URL from the configured Jira base URL."""
@@ -1034,3 +1110,304 @@ class TestDisplayNameMethods:
         sp = by_name["Story Points"]
         assert "name" not in sp
         assert sp["field_id"] == "customfield_10001"
+
+
+class TestEmptyCustomFieldFiltering:
+    """Null custom fields must not pollute an all-fields response.
+
+    A ``*all`` request on a real Jira instance returns hundreds of custom
+    fields, nearly all of them reported as ``null``. Those are dropped from the
+    output while ``custom_fields`` itself stays complete for the other
+    consumers.
+
+    The rule is deliberately narrow: **only** ``None`` is dropped. A blank
+    string or an empty list is not "no value", it is a value somebody set - a
+    cleared text field, a deliberately emptied multi-select - and hiding it
+    would hide real issue state.
+    """
+
+    @pytest.fixture()
+    def api_data(self):
+        """API payload mixing empty, falsy-but-meaningful and populated fields."""
+        return {
+            "id": "500",
+            "key": "EMPTY-1",
+            "fields": {
+                "summary": "Empty custom field test",
+                "customfield_10011": None,
+                "customfield_10012": [],
+                "customfield_10013": "",
+                "customfield_10014": "   ",
+                "customfield_10015": {},
+                "customfield_10016": 0,
+                "customfield_10017": False,
+                "customfield_10018": "Populated",
+            },
+            "names": {
+                "customfield_10011": "Epic Name",
+                "customfield_10012": "Sprint",
+                "customfield_10013": "Notes",
+                "customfield_10014": "Blank",
+                "customfield_10015": "Empty Object",
+                "customfield_10016": "Story Points",
+                "customfield_10017": "Flagged",
+                "customfield_10018": "Team",
+            },
+        }
+
+    # Fields Jira reports as having no value at all.
+    NULL_IDS = ("customfield_10011",)
+
+    # Fields that hold an empty value somebody set. Not the same thing.
+    EMPTY_BUT_SET_IDS = (
+        "customfield_10012",
+        "customfield_10013",
+        "customfield_10014",
+        "customfield_10015",
+    )
+
+    # -- dropping ----------------------------------------------------------
+
+    def test_all_fields_drops_null_custom_fields(self, api_data):
+        """A field Jira reports as ``null`` is omitted from ``*all`` output."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
+
+        simplified = issue.to_simplified_dict()
+
+        for field_id in self.NULL_IDS:
+            assert field_id not in simplified, f"{field_id} should have been dropped"
+
+    @pytest.mark.parametrize(
+        ("field_id", "expected_value", "field_name"),
+        [
+            ("customfield_10012", [], "Sprint"),
+            ("customfield_10013", "", "Notes"),
+            ("customfield_10014", "   ", "Blank"),
+            ("customfield_10015", {}, "Empty Object"),
+        ],
+        ids=["empty_list", "empty_string", "whitespace_string", "empty_object"],
+    )
+    def test_all_fields_keeps_values_that_are_merely_empty(
+        self, api_data, field_id, expected_value, field_name
+    ):
+        """Only ``null`` is dropped - an emptied value is still a value.
+
+        This pins the deliberate choice to filter on ``is None`` alone. An
+        empty string or empty list is what a human leaves behind when they
+        clear a text field or empty a multi-select, and the caller must be able
+        to see that state instead of it looking like the field was never set.
+        """
+        issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
+
+        simplified = issue.to_simplified_dict()
+
+        assert field_id in simplified, f"{field_id} should have survived"
+        assert simplified[field_id] == {
+            "value": expected_value,
+            "name": field_name,
+        }
+
+    def test_all_fields_keeps_populated_custom_fields(self, api_data):
+        """Dropping nulls must not touch fields that carry a value."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
+
+        simplified = issue.to_simplified_dict()
+
+        assert simplified["customfield_10018"] == {
+            "value": "Populated",
+            "name": "Team",
+        }
+
+    @pytest.mark.parametrize(
+        ("field_id", "expected_value"),
+        [("customfield_10016", 0), ("customfield_10017", False)],
+    )
+    def test_falsy_but_meaningful_values_are_kept(
+        self, api_data, field_id, expected_value
+    ):
+        """Zero and False are real values, not emptiness."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
+
+        simplified = issue.to_simplified_dict()
+
+        assert field_id in simplified
+        value = simplified[field_id]["value"]
+        assert value == expected_value
+        # `0 == False` in Python, so equality alone cannot tell the two cases
+        # apart. The type is what must survive: an int must not arrive as a
+        # bool, or vice versa.
+        assert type(value) is type(expected_value)
+
+    def test_display_name_dict_drops_only_null_custom_fields(self, api_data):
+        """jira_get_issue / jira_search return to_display_name_dict output."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
+
+        display = issue.to_display_name_dict()
+
+        assert "Epic Name" not in display
+        assert display["Sprint"]["value"] == []
+        assert display["Notes"]["value"] == ""
+        assert display["Team"]["value"] == "Populated"
+
+    # -- explicitly requested fields are exempt ----------------------------
+
+    def test_explicitly_requested_null_is_kept(self, api_data):
+        """A field asked for by id is reported even when it is null."""
+        issue = JiraIssue.from_api_response(
+            api_data, requested_fields="summary,customfield_10011"
+        )
+
+        simplified = issue.to_simplified_dict()
+
+        assert simplified["customfield_10011"] == {
+            "value": None,
+            "name": "Epic Name",
+        }
+
+    def test_explicitly_requested_empty_list_is_kept_by_display_name(self, api_data):
+        """A field asked for by display name is reported even when empty."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields=["Sprint"])
+
+        simplified = issue.to_simplified_dict()
+
+        assert simplified["customfield_10012"] == {"value": [], "name": "Sprint"}
+
+    def test_explicitly_requested_empty_string_is_kept_via_cf_alias(self, api_data):
+        """The ``cf_XXXXX`` alias is an explicit request too."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields=["cf_10013"])
+
+        simplified = issue.to_simplified_dict()
+
+        assert simplified["customfield_10013"] == {"value": "", "name": "Notes"}
+
+    # -- custom_fields itself stays complete -------------------------------
+
+    def test_custom_fields_dict_keeps_empty_entries(self, api_data):
+        """The stored dict is the source of truth and is never filtered."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
+
+        issue.to_simplified_dict()
+
+        for field_id in self.NULL_IDS + self.EMPTY_BUT_SET_IDS:
+            assert field_id in issue.custom_fields
+
+    def test_to_simplified_dict_does_not_mutate_custom_fields(self, api_data):
+        """Two consecutive calls must see the same stored fields."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
+
+        before = dict(issue.custom_fields)
+        first = issue.to_simplified_dict()
+        second = issue.to_simplified_dict()
+
+        assert issue.custom_fields == before
+        assert first == second
+
+    def test_attribute_access_to_empty_custom_field_still_works(self, api_data):
+        """``issue.customfield_10011`` falls back to custom_fields."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
+
+        issue.to_simplified_dict()
+
+        assert issue.customfield_10011 == {"value": None, "name": "Epic Name"}
+
+    def test_custom_fields_by_display_name_keeps_empty_entries(self, api_data):
+        """The display-name view reads custom_fields directly, unfiltered."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
+
+        by_name = issue.custom_fields_by_display_name
+
+        assert by_name["Epic Name"] == {
+            "value": None,
+            "field_id": "customfield_10011",
+        }
+
+    def test_find_custom_field_in_issue_still_finds_empty_field(self, api_data):
+        """Epic lookups walk custom_fields and must still see empty fields."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
+
+        field_id, field_value = issue._find_custom_field_in_issue("Sprint")
+
+        assert field_id == "customfield_10012"
+        assert field_value == {"value": [], "name": "Sprint"}
+
+    # -- the non-prefixed sentinel key -------------------------------------
+
+    # The shape jira/issues.py stores under the "attachment_results" key,
+    # i.e. the return value of upload_attachments().
+    SENTINEL_VALUE = {
+        "success": True,
+        "issue_key": "EMPTY-1",
+        "total": 1,
+        "uploaded": [{"filename": "photo.png", "size": 12, "id": "1"}],
+        "failed": [],
+    }
+
+    @pytest.mark.parametrize(
+        "sentinel",
+        [SENTINEL_VALUE, [{"filename": "photo.png", "status": "uploaded"}]],
+        ids=["upload_summary_dict", "list_payload"],
+    )
+    def test_attachment_results_sentinel_is_not_dropped(self, api_data, sentinel):
+        """``update_issue`` stores a non-prefixed key in custom_fields."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields="*all")
+        issue.custom_fields["attachment_results"] = sentinel
+
+        simplified = issue.to_simplified_dict()
+
+        assert simplified["attachment_results"] == sentinel
+
+    def test_sentinel_does_not_break_display_name_requests(self, api_data):
+        """The sentinel entry must not derail a display-name lookup."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields=["Team"])
+        issue.custom_fields["attachment_results"] = self.SENTINEL_VALUE
+
+        simplified = issue.to_simplified_dict()
+
+        assert simplified["customfield_10018"] == {
+            "value": "Populated",
+            "name": "Team",
+        }
+
+    # -- requested_fields normalization ------------------------------------
+
+    def test_comma_joined_entry_inside_a_list_is_split(self, api_data):
+        """``["a,b"]`` must select two fields, not zero."""
+        issue = JiraIssue.from_api_response(
+            api_data, requested_fields=["customfield_10011,customfield_10018"]
+        )
+
+        simplified = issue.to_simplified_dict()
+
+        assert simplified["customfield_10011"] == {
+            "value": None,
+            "name": "Epic Name",
+        }
+        assert simplified["customfield_10018"]["value"] == "Populated"
+
+    def test_all_marker_inside_a_list_behaves_like_all(self, api_data):
+        """``["*all"]`` must mean every field, with nulls still dropped."""
+        issue = JiraIssue.from_api_response(api_data, requested_fields=["*all"])
+
+        assert issue.requested_fields == "*all"
+
+        simplified = issue.to_simplified_dict()
+
+        assert simplified["customfield_10018"]["value"] == "Populated"
+        assert "customfield_10011" not in simplified
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            (None, None),
+            ("*all", "*all"),
+            ("summary, status", ["summary", "status"]),
+            (["summary,status"], ["summary", "status"]),
+            (["*all"], "*all"),
+            (["summary", "*all"], "*all"),
+            (("summary", "status"), ["summary", "status"]),
+            ("", []),
+        ],
+    )
+    def test_normalize_requested_fields(self, raw, expected):
+        """The selector is canonicalised before it reaches the model."""
+        assert JiraIssue._normalize_requested_fields(raw) == expected

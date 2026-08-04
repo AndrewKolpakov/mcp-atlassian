@@ -440,6 +440,146 @@ class TestMarkdownToAdf:
         link_mark = next(m for m in link_nodes[0]["marks"] if m["type"] == "link")
         assert link_mark["attrs"]["href"] == "https://example.com"
 
+    def test_link_without_inline_formatting_stays_one_node(self) -> None:
+        """Unformatted link text stays a single text node with one link mark."""
+        result = markdown_to_adf("[click here](https://example.com)")
+
+        assert result["content"][0]["content"] == [
+            {
+                "type": "text",
+                "text": "click here",
+                "marks": [{"type": "link", "attrs": {"href": "https://example.com"}}],
+            }
+        ]
+
+    def test_link_text_inline_formatting_becomes_nested_marks(self) -> None:
+        """Markup inside link text becomes marks, not literal characters."""
+        href = "https://example.com/x"
+        result = markdown_to_adf(f"See [**bold** and `code` link]({href}) here")
+
+        assert result["content"][0]["content"] == [
+            {"type": "text", "text": "See "},
+            {
+                "type": "text",
+                "text": "bold",
+                "marks": [
+                    {"type": "strong"},
+                    {"type": "link", "attrs": {"href": href}},
+                ],
+            },
+            {
+                "type": "text",
+                "text": " and ",
+                "marks": [{"type": "link", "attrs": {"href": href}}],
+            },
+            {
+                "type": "text",
+                "text": "code",
+                "marks": [
+                    {"type": "code"},
+                    {"type": "link", "attrs": {"href": href}},
+                ],
+            },
+            {
+                "type": "text",
+                "text": " link",
+                "marks": [{"type": "link", "attrs": {"href": href}}],
+            },
+            {"type": "text", "text": " here"},
+        ]
+
+    def test_link_text_bold_keeps_inner_asterisk(self) -> None:
+        """Bold link text is unwrapped without leaking its asterisks."""
+        result = markdown_to_adf("[**a*b**](u)")
+
+        assert result["content"][0]["content"] == [
+            {
+                "type": "text",
+                "text": "a*b",
+                "marks": [
+                    {"type": "strong"},
+                    {"type": "link", "attrs": {"href": "u"}},
+                ],
+            }
+        ]
+
+    def test_link_text_strike_and_code_nest_under_link(self) -> None:
+        """Every segment of a formatted link text keeps the link mark."""
+        result = markdown_to_adf("[~~s~~ and `c`](u)")
+        content = result["content"][0]["content"]
+
+        assert [n["text"] for n in content] == ["s", " and ", "c"]
+        assert [[m["type"] for m in n["marks"]] for n in content] == [
+            ["strike", "link"],
+            ["link"],
+            ["code", "link"],
+        ]
+        assert all(
+            next(m for m in n["marks"] if m["type"] == "link")["attrs"]["href"] == "u"
+            for n in content
+        )
+
+    def test_link_text_italic_nests_em_mark(self) -> None:
+        """Italic link text yields an em mark beside the link mark."""
+        result = markdown_to_adf("[*i*](https://example.com)")
+
+        assert result["content"][0]["content"] == [
+            {
+                "type": "text",
+                "text": "i",
+                "marks": [
+                    {"type": "em"},
+                    {"type": "link", "attrs": {"href": "https://example.com"}},
+                ],
+            }
+        ]
+
+    def test_link_text_issue_key_keeps_a_single_link_mark(self) -> None:
+        """Issue keys inside link text do not add a second link mark."""
+        result = markdown_to_adf(
+            "[PROJ-123 details](https://example.com/x)",
+            jira_base_url="https://jira.example.com",
+        )
+        content = result["content"][0]["content"]
+
+        for node in content:
+            link_marks = [m for m in node.get("marks", []) if m["type"] == "link"]
+            assert len(link_marks) == 1
+            assert link_marks[0]["attrs"]["href"] == "https://example.com/x"
+
+    def test_link_marks_are_not_shared_between_nodes(self) -> None:
+        """Each node gets its own link mark object, so edits stay local."""
+        result = markdown_to_adf("[**b** t](https://example.com)")
+        content = result["content"][0]["content"]
+        first_link = next(m for m in content[0]["marks"] if m["type"] == "link")
+        first_link["attrs"]["href"] = "https://mutated.example.com"
+
+        second_link = next(m for m in content[1]["marks"] if m["type"] == "link")
+        assert second_link["attrs"]["href"] == "https://example.com"
+
+    def test_link_text_formatting_inside_list_item(self) -> None:
+        """List items share the inline parser, so nested marks work there too."""
+        result = markdown_to_adf("- see [**bold** link](https://example.com)")
+        bullet_list = next(n for n in result["content"] if n["type"] == "bulletList")
+        paragraph = bullet_list["content"][0]["content"][0]
+
+        assert paragraph["content"] == [
+            {"type": "text", "text": "see "},
+            {
+                "type": "text",
+                "text": "bold",
+                "marks": [
+                    {"type": "strong"},
+                    {"type": "link", "attrs": {"href": "https://example.com"}},
+                ],
+            },
+            {
+                "type": "text",
+                "text": " link",
+                "marks": [{"type": "link", "attrs": {"href": "https://example.com"}}],
+            },
+        ]
+
     # -- Mentions -----------------------------------------------------------
 
     def test_mention_modern_account_id(self):
@@ -568,6 +708,117 @@ class TestMarkdownToAdf:
             )
         else:
             assert not link_marks
+
+    @staticmethod
+    def _linked_texts(nodes: list[dict[str, Any]]) -> set[str]:
+        """Collect the text of every node carrying a link mark."""
+        return {
+            node["text"]
+            for node in nodes
+            if any(mark["type"] == "link" for mark in node.get("marks", []))
+        }
+
+    def test_known_project_keys_scopes_issue_key_links(self) -> None:
+        """Only keys of known projects are linked; other tokens stay plain text."""
+        text = "Tracked in PLOOP-12466. Sequence PR-1 .. PR-17."
+        result = markdown_to_adf(
+            text,
+            jira_base_url="https://jira.example.com",
+            known_project_keys={"PLOOP"},
+        )
+        nodes = result["content"][0]["content"]
+
+        assert self._linked_texts(nodes) == {"PLOOP-12466"}
+        # Nothing is dropped: the unknown keys survive as literal text.
+        assert "".join(node["text"] for node in nodes) == text
+        pr_node = next(node for node in nodes if "PR-1" in node["text"])
+        assert pr_node.get("marks", []) == []
+
+    def test_issue_key_links_stay_unscoped_by_default(self) -> None:
+        """Omitting the allowlist keeps the historical link-everything behavior."""
+        result = markdown_to_adf(
+            "Tracked in PLOOP-12466. Sequence PR-1 .. PR-17.",
+            jira_base_url="https://jira.example.com",
+        )
+        nodes = result["content"][0]["content"]
+
+        assert self._linked_texts(nodes) == {"PLOOP-12466", "PR-1", "PR-17"}
+
+    @pytest.mark.parametrize("configured_key", ["ploop", "  PLOOP  ", "\tPlOoP\n"])
+    def test_known_project_keys_ignore_case_and_padding(
+        self, configured_key: str
+    ) -> None:
+        """A lower-case or whitespace-padded project key still matches."""
+        result = markdown_to_adf(
+            "Tracked in PLOOP-12466 and PR-1.",
+            jira_base_url="https://jira.example.com",
+            known_project_keys={configured_key},
+        )
+        nodes = result["content"][0]["content"]
+
+        assert self._linked_texts(nodes) == {"PLOOP-12466"}
+
+    def test_known_project_keys_apply_inside_inline_formatting(self) -> None:
+        """The allowlist also scopes keys inside bold text and list items."""
+        result = markdown_to_adf(
+            "**PLOOP-12466 blocks PR-1**\n\n- PLOOP-12466 and PR-17",
+            jira_base_url="https://jira.example.com",
+            known_project_keys={"PLOOP"},
+        )
+        bold_nodes = result["content"][0]["content"]
+        item_nodes = result["content"][1]["content"][0]["content"][0]["content"]
+
+        assert all(
+            any(mark["type"] == "strong" for mark in node["marks"])
+            for node in bold_nodes
+        )
+        assert self._linked_texts(bold_nodes) == {"PLOOP-12466"}
+        assert self._linked_texts(item_nodes) == {"PLOOP-12466"}
+
+    @pytest.mark.parametrize(
+        ("table", "table_id"),
+        [
+            pytest.param(
+                "| Key | Note |\n|---|---|\n| PLOOP-12466 | see PR-17 |",
+                "markdown",
+                id="markdown-table",
+            ),
+            pytest.param(
+                "||Key||Note||\n|PLOOP-12466|see PR-17|",
+                "wiki",
+                id="wiki-table",
+            ),
+        ],
+    )
+    def test_known_project_keys_apply_inside_table_cells(
+        self, table: str, table_id: str
+    ) -> None:
+        """A table cell is no more permissive than running prose.
+
+        Table cells are built by a separate helper from the one that handles
+        paragraphs, so the allowlist has to be threaded into it explicitly. A
+        cell that parsed its content without the allowlist would auto-link
+        every key-shaped token again, in either dialect, and no paragraph-level
+        test would notice.
+        """
+        result = markdown_to_adf(
+            table,
+            jira_base_url="https://jira.example.com",
+            known_project_keys={"PLOOP"},
+        )
+
+        table_node = next(n for n in result["content"] if n["type"] == "table")
+        paragraphs = [
+            paragraph
+            for row in table_node["content"]
+            for cell in row["content"]
+            for paragraph in cell["content"]
+        ]
+        linked: set[str] = set()
+        for paragraph in paragraphs:
+            linked |= self._linked_texts(paragraph.get("content", []))
+
+        assert linked == {"PLOOP-12466"}, table_id
 
     # -- Code blocks --------------------------------------------------------
 
