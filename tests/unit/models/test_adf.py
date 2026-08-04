@@ -439,6 +439,146 @@ class TestMarkdownToAdf:
         link_mark = next(m for m in link_nodes[0]["marks"] if m["type"] == "link")
         assert link_mark["attrs"]["href"] == "https://example.com"
 
+    def test_link_without_inline_formatting_stays_one_node(self) -> None:
+        """Unformatted link text stays a single text node with one link mark."""
+        result = markdown_to_adf("[click here](https://example.com)")
+
+        assert result["content"][0]["content"] == [
+            {
+                "type": "text",
+                "text": "click here",
+                "marks": [{"type": "link", "attrs": {"href": "https://example.com"}}],
+            }
+        ]
+
+    def test_link_text_inline_formatting_becomes_nested_marks(self) -> None:
+        """Markup inside link text becomes marks, not literal characters."""
+        href = "https://example.com/x"
+        result = markdown_to_adf(f"See [**bold** and `code` link]({href}) here")
+
+        assert result["content"][0]["content"] == [
+            {"type": "text", "text": "See "},
+            {
+                "type": "text",
+                "text": "bold",
+                "marks": [
+                    {"type": "strong"},
+                    {"type": "link", "attrs": {"href": href}},
+                ],
+            },
+            {
+                "type": "text",
+                "text": " and ",
+                "marks": [{"type": "link", "attrs": {"href": href}}],
+            },
+            {
+                "type": "text",
+                "text": "code",
+                "marks": [
+                    {"type": "code"},
+                    {"type": "link", "attrs": {"href": href}},
+                ],
+            },
+            {
+                "type": "text",
+                "text": " link",
+                "marks": [{"type": "link", "attrs": {"href": href}}],
+            },
+            {"type": "text", "text": " here"},
+        ]
+
+    def test_link_text_bold_keeps_inner_asterisk(self) -> None:
+        """Bold link text is unwrapped without leaking its asterisks."""
+        result = markdown_to_adf("[**a*b**](u)")
+
+        assert result["content"][0]["content"] == [
+            {
+                "type": "text",
+                "text": "a*b",
+                "marks": [
+                    {"type": "strong"},
+                    {"type": "link", "attrs": {"href": "u"}},
+                ],
+            }
+        ]
+
+    def test_link_text_strike_and_code_nest_under_link(self) -> None:
+        """Every segment of a formatted link text keeps the link mark."""
+        result = markdown_to_adf("[~~s~~ and `c`](u)")
+        content = result["content"][0]["content"]
+
+        assert [n["text"] for n in content] == ["s", " and ", "c"]
+        assert [[m["type"] for m in n["marks"]] for n in content] == [
+            ["strike", "link"],
+            ["link"],
+            ["code", "link"],
+        ]
+        assert all(
+            next(m for m in n["marks"] if m["type"] == "link")["attrs"]["href"] == "u"
+            for n in content
+        )
+
+    def test_link_text_italic_nests_em_mark(self) -> None:
+        """Italic link text yields an em mark beside the link mark."""
+        result = markdown_to_adf("[*i*](https://example.com)")
+
+        assert result["content"][0]["content"] == [
+            {
+                "type": "text",
+                "text": "i",
+                "marks": [
+                    {"type": "em"},
+                    {"type": "link", "attrs": {"href": "https://example.com"}},
+                ],
+            }
+        ]
+
+    def test_link_text_issue_key_keeps_a_single_link_mark(self) -> None:
+        """Issue keys inside link text do not add a second link mark."""
+        result = markdown_to_adf(
+            "[PROJ-123 details](https://example.com/x)",
+            jira_base_url="https://jira.example.com",
+        )
+        content = result["content"][0]["content"]
+
+        for node in content:
+            link_marks = [m for m in node.get("marks", []) if m["type"] == "link"]
+            assert len(link_marks) == 1
+            assert link_marks[0]["attrs"]["href"] == "https://example.com/x"
+
+    def test_link_marks_are_not_shared_between_nodes(self) -> None:
+        """Each node gets its own link mark object, so edits stay local."""
+        result = markdown_to_adf("[**b** t](https://example.com)")
+        content = result["content"][0]["content"]
+        first_link = next(m for m in content[0]["marks"] if m["type"] == "link")
+        first_link["attrs"]["href"] = "https://mutated.example.com"
+
+        second_link = next(m for m in content[1]["marks"] if m["type"] == "link")
+        assert second_link["attrs"]["href"] == "https://example.com"
+
+    def test_link_text_formatting_inside_list_item(self) -> None:
+        """List items share the inline parser, so nested marks work there too."""
+        result = markdown_to_adf("- see [**bold** link](https://example.com)")
+        bullet_list = next(n for n in result["content"] if n["type"] == "bulletList")
+        paragraph = bullet_list["content"][0]["content"][0]
+
+        assert paragraph["content"] == [
+            {"type": "text", "text": "see "},
+            {
+                "type": "text",
+                "text": "bold",
+                "marks": [
+                    {"type": "strong"},
+                    {"type": "link", "attrs": {"href": "https://example.com"}},
+                ],
+            },
+            {
+                "type": "text",
+                "text": " link",
+                "marks": [{"type": "link", "attrs": {"href": "https://example.com"}}],
+            },
+        ]
+
     # -- Mentions -----------------------------------------------------------
 
     def test_mention_modern_account_id(self):

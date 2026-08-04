@@ -63,6 +63,42 @@ def _append_text_nodes(
         nodes.append(node)
 
 
+def _apply_marks(
+    nodes: list[dict[str, Any]],
+    marks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Add marks to already-parsed inline nodes, keeping their own marks first.
+
+    Mark types a node already carries are skipped, so a node never ends up
+    with two marks of the same type (two ``link`` marks on a single text node
+    are invalid ADF).
+
+    Args:
+        nodes: Inline nodes to decorate; non-text nodes are left untouched.
+        marks: Marks to add to every text node.
+
+    Returns:
+        The same list, with the marks merged into its text nodes in place.
+    """
+    if not marks:
+        return nodes
+
+    for node in nodes:
+        if node.get("type") != "text":
+            continue
+        existing: list[dict[str, Any]] = node.get("marks", [])
+        existing_types = {mark.get("type") for mark in existing}
+        extra = [
+            copy.deepcopy(mark)
+            for mark in marks
+            if mark.get("type") not in existing_types
+        ]
+        if extra:
+            node["marks"] = [*existing, *extra]
+
+    return nodes
+
+
 def _parse_inline_formatting(
     text: str, jira_base_url: str = ""
 ) -> list[dict[str, Any]]:
@@ -71,6 +107,9 @@ def _parse_inline_formatting(
     Handles: bold (**), italic (*), inline code (`), links ([text](url)),
     strikethrough (~~), and Jira-flavored user mentions
     ([~accountid:ACCOUNT_ID] or @[Display Name](accountid:ACCOUNT_ID)).
+
+    Link text is parsed recursively, so inline markup inside it becomes
+    nested marks instead of literal characters.
 
     Bare Jira issue keys are converted to links when ``jira_base_url`` is set.
 
@@ -152,17 +191,19 @@ def _parse_inline_formatting(
                 [{"type": "strike"}],
             )
         elif m.group("link_text") is not None:
-            nodes.append(
-                {
-                    "type": "text",
-                    "text": m.group("link_text"),
-                    "marks": [
-                        {
-                            "type": "link",
-                            "attrs": {"href": m.group("link_href")},
-                        }
-                    ],
-                }
+            link_mark: dict[str, Any] = {
+                "type": "link",
+                "attrs": {"href": m.group("link_href")},
+            }
+            # Link text can carry its own inline markup, so parse it
+            # recursively and stack the link mark on top of the nested marks.
+            # Issue-key autolinking stays off inside link text: a second link
+            # mark on the same text node is invalid ADF.
+            nodes.extend(
+                _apply_marks(
+                    _parse_inline_formatting(m.group("link_text")),
+                    [link_mark],
+                )
             )
         elif m.group("italic_inner") is not None:
             _append_text_nodes(
