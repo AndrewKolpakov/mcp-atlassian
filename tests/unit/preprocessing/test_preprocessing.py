@@ -1,5 +1,4 @@
 import re
-import time
 
 import pytest
 
@@ -2144,18 +2143,27 @@ class TestInlineMarkupBoundaries:
         A per-occurrence placeholder list needs a full-text ``str.replace``
         for every stored item, which made a single 32 KB field of escaped
         markers (Jira's field cap) take ~1.5 s of pure read path.
+
+        The placeholder count is the whole property, so it is asserted directly
+        rather than timed: it is one per *escapable character*, never one per
+        occurrence, and stays so no matter how large the field grows. A
+        wall-clock threshold would only observe that property indirectly, and
+        would go flaky on a loaded runner.
         """
         protected = _protect_escaped_chars(r"\+" * 5000 + r"\_" * 5000)
         placeholders = set(re.findall(r"\x00ESC\d+\x00", protected))
         assert len(placeholders) == 2, "one placeholder per character, not per escape"
         assert len(placeholders) < len(_ESCAPABLE_CHARS)
 
+        # A full 32 KB field of one escape: distinct placeholders stay at one,
+        # though the escape occurs 16383 times. The regressed implementation
+        # minted a placeholder per occurrence, so this set tracked the
+        # occurrence count and every member cost its own full-text replace.
         field = r"\+" * 16383
-        start = time.perf_counter()
-        result = preprocessor.jira_to_markdown(field)
-        elapsed = time.perf_counter() - start
-        assert result == r"\+" * 16383
-        assert elapsed < 0.5, f"32 KB of escapes took {elapsed:.3f}s"
+        occurrences = re.findall(r"\x00ESC\d+\x00", _protect_escaped_chars(field))
+        assert len(occurrences) == 16383
+        assert len(set(occurrences)) == 1
+        assert preprocessor.jira_to_markdown(field) == field
 
     @pytest.mark.parametrize(
         "text, expected",
