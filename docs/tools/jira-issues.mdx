@@ -12,7 +12,7 @@ Get details of a specific Jira issue.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `issue_key` | `string` | Yes | Jira issue key (e.g., 'PROJ-123', 'ACV2-642') |
-| `fields` | `string` | No | (Optional) Comma-separated list of fields to return (e.g., 'summary,status,customfield_10010'). You may also provide a single field as a string (e.g., 'duedate'). Use '*all' for all fields (including custom fields), or omit for essential fields only. |
+| `fields` | `string` | No | (Optional) Comma-separated list of fields to return (e.g., 'summary,status,customfield_10010'). You may also provide a single field as a string (e.g., 'duedate'). Use '*all' for all fields (including custom fields; custom fields Jira reports as empty (null) are omitted), or omit for essential fields only. Name a custom field explicitly to see it even when it is null. |
 | `expand` | `string` | No | (Optional) Fields to expand. Examples: 'renderedFields' (for rendered content), 'transitions' (for available status transitions), 'changelog' (for history) |
 | `comment_limit` | `integer` | No | Maximum number of comments to include (0 or null for no comments) |
 | `properties` | `string` | No | (Optional) A comma-separated list of issue properties to return |
