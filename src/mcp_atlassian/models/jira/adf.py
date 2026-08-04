@@ -297,9 +297,23 @@ def _build_table_node(
 
     Each row is parsed in its own dialect: rows written as ``||a||b||`` are
     split on ``||`` and become header cells, every other row is split on a
-    single ``|``. Markdown alignment separators (``|---|:---:|``) are dropped.
-    Rows that still disagree on width are padded with empty cells so the ADF
-    table stays rectangular, and a single warning per table reports it.
+    single ``|``. The first row is a header row in both dialects, so a wiki
+    row further down a Markdown table adds a header row instead of demoting
+    the Markdown one. Alignment separators (``|---|:---:|`` and their wiki
+    spelling ``||---||---||``) are dropped before the dialect is decided, so a
+    row that is thrown away cannot give a Markdown table wiki semantics.
+
+    Only a table that really holds a wiki row is changed beyond that: its rows
+    are padded with empty cells so the ADF table stays rectangular, and one
+    warning per table names the construct that was translated. A table without
+    wiki rows is emitted exactly as the Markdown-only converter emitted it --
+    ragged if the source was ragged, and silently.
+
+    Known limits: the code-span-aware splitter is used for data rows only
+    inside a recognised wiki table, so ``|[a || b](https://e.example.com)|c|``
+    still splits naively in a pure Markdown table, and a delimiter inside a
+    double-backtick span still splits, because nothing in this module
+    understands double-backtick spans.
 
     Args:
         table_lines: Consecutive lines forming one table block.
@@ -309,41 +323,60 @@ def _build_table_node(
         ADF table node, or None when every line was a separator.
     """
     wiki_rows = [_wiki_table_row_cells(line) for line in table_lines]
-    has_wiki_header = any(cells is not None for cells in wiki_rows)
+
+    # Separators are dropped first: a row that is thrown away must not decide
+    # the dialect. Their cells hold only "-", ":" and spaces, on which both
+    # splitters agree, so the naive split recognises them either way.
+    kept: list[tuple[str, list[str] | None]] = []
+    for line, wiki_cells in zip(table_lines, wiki_rows, strict=True):
+        probe = (
+            wiki_cells
+            if wiki_cells is not None
+            else [c.strip() for c in line.strip("|").split("|")]
+        )
+        if all(_TABLE_SEPARATOR_RE.match(c) for c in probe if c):
+            continue
+        kept.append((line, wiki_cells))
+
+    if not kept:
+        return None
+
+    has_wiki_header = any(wiki_cells is not None for _, wiki_cells in kept)
 
     parsed_rows: list[tuple[bool, list[str]]] = []
-    for line, wiki_cells in zip(table_lines, wiki_rows, strict=True):
+    for line, wiki_cells in kept:
         if wiki_cells is not None:
             cells = wiki_cells
         elif has_wiki_header:
             cells = [c.strip() for c in _split_table_cells(line.strip("|"), "|")]
         else:
             cells = [c.strip() for c in line.strip("|").split("|")]
-        if all(_TABLE_SEPARATOR_RE.match(c) for c in cells if c):
-            continue
         parsed_rows.append((wiki_cells is not None, cells))
-
-    if not parsed_rows:
-        return None
-
-    if has_wiki_header:
-        logger.debug("Parsed %d wiki-markup table row(s)", len(parsed_rows))
 
     widths = {len(cells) for _, cells in parsed_rows}
     column_count = max(widths)
-    if len(widths) > 1:
+    if has_wiki_header:
+        mismatch = ""
+        if len(widths) > 1:
+            mismatch = (
+                f". Rows had mismatched column counts {sorted(widths)}; "
+                f"padded every row to {column_count} columns"
+            )
         logger.warning(
-            "Table rows have mismatched column counts %s; "
-            "padding every row to %d columns",
-            sorted(widths),
-            column_count,
+            'Converted %d Jira wiki markup table row(s) ("||a||b||") to ADF; '
+            "no other wiki construct is translated%s",
+            sum(1 for is_wiki, _ in parsed_rows if is_wiki),
+            mismatch,
         )
 
     adf_rows: list[dict[str, Any]] = []
     for idx, (is_wiki_row, cells) in enumerate(parsed_rows):
-        is_header = is_wiki_row if has_wiki_header else idx == 0
-        cell_type = "tableHeader" if is_header else "tableCell"
-        padded = cells + [""] * (column_count - len(cells))
+        cell_type = "tableHeader" if is_wiki_row or idx == 0 else "tableCell"
+        # Only a wiki table is squared off; a ragged Markdown table stays
+        # ragged so that Markdown input keeps converting byte-identically.
+        padded = (
+            cells + [""] * (column_count - len(cells)) if has_wiki_header else cells
+        )
         adf_cells = []
         for cell_text in padded:
             content = _parse_inline_formatting(cell_text, jira_base_url)

@@ -830,6 +830,11 @@ class TestMarkdownToAdf:
         return [len(row["content"]) for row in table["content"]]
 
     @staticmethod
+    def _adf_records(records: list[logging.LogRecord]) -> list[logging.LogRecord]:
+        """Return only the log records emitted by the ADF converter module."""
+        return [r for r in records if r.name.endswith("models.jira.adf")]
+
+    @staticmethod
     def _column_count_warnings(records: list[logging.LogRecord]) -> list[str]:
         """Return warning messages emitted about mismatched column counts."""
         return [
@@ -852,13 +857,20 @@ class TestMarkdownToAdf:
         assert self._row_texts(table["content"][1]) == ["Alice", "30", "Paris"]
         assert self._row_texts(table["content"][2]) == ["Bob", "25", "Rome"]
 
-    def test_wiki_table_single_column(self) -> None:
-        """A one-column wiki header '||Only||' produces a single header cell."""
-        md = "||Only||\n|value|"
+    def test_wiki_table_single_column_header_is_detected(self) -> None:
+        """A closed one-column '||Only||' row is read as a wiki header row.
+
+        Its cell count is the same whichever dialect is assumed, so the
+        detection is only observable in the data row: inside a recognised wiki
+        table a '|' in a code span stays literal instead of splitting the row.
+        """
+        md = "||Only||\n|`a | b`|"
         result = markdown_to_adf(md)
         table = next(n for n in result["content"] if n["type"] == "table")
         assert self._column_counts(table) == [1, 1]
+        assert table["content"][0]["content"][0]["type"] == "tableHeader"
         assert self._row_texts(table["content"][0]) == ["Only"]
+        assert self._row_texts(table["content"][1]) == ["a | b"]
 
     def test_wiki_table_unterminated_header_row(self) -> None:
         """A wiki header missing its trailing '||' still yields N columns."""
@@ -881,11 +893,30 @@ class TestMarkdownToAdf:
             "tableCell",
         ]
 
+    def test_midtable_wiki_row_keeps_the_markdown_header_row(self) -> None:
+        """A single wiki-looking row does not demote a Markdown header row."""
+        md = (
+            "| Env | Host |\n|---|---|\n| dev | d.example.com |\n"
+            "||see note||\n| prod | p.example.com |"
+        )
+        result = markdown_to_adf(md)
+        table = next(n for n in result["content"] if n["type"] == "table")
+        cell_types = [row["content"][0]["type"] for row in table["content"]]
+        assert cell_types == [
+            "tableHeader",
+            "tableCell",
+            "tableHeader",
+            "tableCell",
+        ]
+        assert self._row_texts(table["content"][0]) == ["Env", "Host"]
+        assert self._row_texts(table["content"][2]) == ["see note", ""]
+
     def test_wiki_table_cells_keep_inline_formatting(self) -> None:
         """Inline Markdown inside wiki cells is still converted to marks."""
         md = "||**Feature**||Status||\n|Auth|`done`|"
         result = markdown_to_adf(md)
         table = next(n for n in result["content"] if n["type"] == "table")
+        assert self._column_counts(table) == [2, 2]
         header_content = table["content"][0]["content"][0]["content"][0]["content"]
         assert header_content[0]["text"] == "Feature"
         assert header_content[0]["marks"] == [{"type": "strong"}]
@@ -894,11 +925,20 @@ class TestMarkdownToAdf:
 
     def test_wiki_table_cells_link_issue_keys(self) -> None:
         """Wiki cells go through the same issue-key linking as Markdown cells."""
-        md = "||Key||\n|ABC-1|"
+        md = "||Key||ABC-2||\n|ABC-1|x|"
         result = markdown_to_adf(md, "https://jira.example.com")
         table = next(n for n in result["content"] if n["type"] == "table")
-        node = table["content"][1]["content"][0]["content"][0]["content"][0]
-        assert node["marks"] == [
+        assert self._column_counts(table) == [2, 2]
+        header_node = table["content"][0]["content"][1]["content"][0]["content"][0]
+        assert header_node["text"] == "ABC-2"
+        assert header_node["marks"] == [
+            {
+                "type": "link",
+                "attrs": {"href": "https://jira.example.com/browse/ABC-2"},
+            }
+        ]
+        data_node = table["content"][1]["content"][0]["content"][0]["content"][0]
+        assert data_node["marks"] == [
             {
                 "type": "link",
                 "attrs": {"href": "https://jira.example.com/browse/ABC-1"},
@@ -912,6 +952,24 @@ class TestMarkdownToAdf:
         table = next(n for n in result["content"] if n["type"] == "table")
         assert self._column_counts(table) == [2, 2]
         assert self._row_texts(table["content"][1]) == ["1", "2"]
+
+    @pytest.mark.parametrize(
+        "separator", ["||---||---||", "||-||-||", "||:---||---:||"]
+    )
+    def test_wiki_spelled_separator_alone_is_not_a_wiki_table(
+        self, separator: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A separator row that is dropped cannot give a table wiki semantics."""
+        md = f"| a | b |\n{separator}\n| 1 | 2 |"
+        with caplog.at_level(logging.DEBUG):
+            result = markdown_to_adf(md)
+
+        table = next(n for n in result["content"] if n["type"] == "table")
+        assert self._column_counts(table) == [2, 2]
+        assert all(c["type"] == "tableHeader" for c in table["content"][0]["content"])
+        assert self._row_texts(table["content"][0]) == ["a", "b"]
+        assert all(c["type"] == "tableCell" for c in table["content"][1]["content"])
+        assert self._adf_records(caplog.records) == []
 
     def test_wiki_table_double_pipe_in_code_span_is_not_a_delimiter(self) -> None:
         """'||' inside a code span does not split a wiki cell."""
@@ -987,6 +1045,46 @@ class TestMarkdownToAdf:
 
     # -- Ragged tables ------------------------------------------------------
 
+    def test_wiki_table_warns_once_naming_the_construct(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """One warning per wiki table names it and counts its wiki rows only."""
+        md = "||A||B||\n|1|2|\n|3|4|\n|5|6|"
+        with caplog.at_level(logging.DEBUG):
+            markdown_to_adf(md)
+
+        records = self._adf_records(caplog.records)
+        assert [r.levelno for r in records] == [logging.WARNING]
+        message = records[0].getMessage()
+        assert message.startswith("Converted 1 Jira wiki markup table row(s)")
+        assert "column counts" not in message
+
+    @pytest.mark.parametrize(
+        ("md", "expected_counts"),
+        [
+            ("| a | b | c |\n|---|---|---|\n| 1 |\n| 2 |", [3, 1, 1]),
+            ("| a | b |\n|---|---|\n||x|", [2, 1]),
+        ],
+    )
+    def test_ragged_markdown_table_is_left_alone_and_silent(
+        self,
+        md: str,
+        expected_counts: list[int],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A table without wiki rows keeps its ragged shape and logs nothing.
+
+        Padding it would change output that has nothing to do with wiki
+        headers, and warning about it would be noise for content the caller
+        often did not author, so the Markdown path is left untouched.
+        """
+        with caplog.at_level(logging.DEBUG):
+            result = markdown_to_adf(md)
+
+        table = next(n for n in result["content"] if n["type"] == "table")
+        assert self._column_counts(table) == expected_counts
+        assert self._adf_records(caplog.records) == []
+
     def test_ragged_wiki_table_is_padded_and_warns_once(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -1002,19 +1100,6 @@ class TestMarkdownToAdf:
         assert len(warnings) == 1
         assert "[2, 3]" in warnings[0]
         assert "3 columns" in warnings[0]
-
-    def test_ragged_markdown_table_is_padded_and_warns_once(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Ragged Markdown rows are padded once per table, not once per row."""
-        md = "| a | b | c |\n|---|---|---|\n| 1 |\n| 2 |"
-        with caplog.at_level(logging.WARNING):
-            result = markdown_to_adf(md)
-
-        table = next(n for n in result["content"] if n["type"] == "table")
-        assert self._column_counts(table) == [3, 3, 3]
-        assert self._row_texts(table["content"][1]) == ["1", "", ""]
-        assert len(self._column_count_warnings(caplog.records)) == 1
 
     def test_wiki_table_wider_data_row_pads_the_header(
         self, caplog: pytest.LogCaptureFixture
@@ -1116,6 +1201,57 @@ class TestMarkdownToAdf:
                 }
             ],
         }
+
+    # -- Known gaps, unchanged by wiki header support ------------------------
+
+    def test_wiki_table_inside_code_macro_is_still_a_table(self) -> None:
+        """'{code}' does not shield its content, before or after this fix.
+
+        Only fenced ``` blocks are honoured, so wiki rows inside a '{code}'
+        macro become a table either way -- ragged before, rectangular now.
+        Wiki header support neither introduces nor closes that gap.
+        """
+        md = "{code}\n||A||B||\n|1|2|\n{code}"
+        result = markdown_to_adf(md)
+        assert [n["type"] for n in result["content"]] == [
+            "paragraph",
+            "table",
+            "paragraph",
+        ]
+
+    def test_markdown_only_table_still_splits_naively(self) -> None:
+        """The code-span-aware splitter runs only inside a wiki table.
+
+        That asymmetry is what keeps Markdown output byte-identical, at the
+        price of the same row parsing differently depending on whether the
+        block also holds a wiki row.
+        """
+        row = "|`a | b`|c|"
+        markdown_only = next(
+            n for n in markdown_to_adf(row)["content"] if n["type"] == "table"
+        )
+        assert self._column_counts(markdown_only) == [3]
+
+        with_wiki_header = next(
+            n
+            for n in markdown_to_adf(f"||H1||H2||\n{row}")["content"]
+            if n["type"] == "table"
+        )
+        assert self._column_counts(with_wiki_header) == [2, 2]
+
+    def test_pipe_in_link_text_splits_a_data_row_in_both_dialects(self) -> None:
+        """A '|' in link text always splits: it is the data-row delimiter.
+
+        Only the link target (after ']('), not the link text, is shielded, so
+        '|[a || b](url)|c|' loses its link on the Markdown and the wiki path
+        alike.
+        """
+        row = "|[a || b](https://e.example.com/x)|c|"
+        for md in (row, f"||H1||H2||\n{row}"):
+            table = next(
+                n for n in markdown_to_adf(md)["content"] if n["type"] == "table"
+            )
+            assert self._column_counts(table)[-1] == 4
 
     # -- Roundtrip ----------------------------------------------------------
 
