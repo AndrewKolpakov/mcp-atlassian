@@ -1672,11 +1672,30 @@ class TestInlineMarkupBoundaries:
     in ordinary prose.  Any second occurrence used to close a span, which ate
     characters out of text nobody wrote as markup.  A span now has to look
     like markup: its content holds no whitespace, or else it opens at the
-    start of a line or after whitespace -- and it never sits inside a URL.
+    start of a line or after whitespace -- and it never sits inside a URL token
+    that carries an explicit scheme.
 
     ``*`` takes only the space-side half of that rule, because Jira does render
     intraword bold, and ``_`` keeps its unbounded pairing because Jira
     italicises intraword underscores as well.
+
+    The rule narrows the corruption class rather than closing it, and it costs
+    conversions Jira does render.  Both limits are pinned below rather than
+    left to be discovered, each by a named test:
+
+    * ``^`` and ``~`` still pair across punctuation-flanked prose --
+      ``test_punctuation_flanked_sup_and_sub_still_pair``.
+    * A URL without a scheme is not protected --
+      ``test_scheme_less_urls_are_not_protected``.
+    * ``+`` and ``??`` stop converting altogether in scripts written without
+      spaces between words --
+      ``test_plus_and_citation_are_unconvertible_in_unspaced_scripts``.
+    * A multi-word span opening against punctuation is left alone wherever the
+      punctuation comes from --
+      ``test_multiword_span_against_punctuation_is_not_converted``,
+      ``test_multiword_span_inside_a_macro_is_not_converted``.
+    * A span glued to the following word is left alone --
+      ``test_span_glued_to_the_following_word_is_not_converted``.
     """
 
     @pytest.fixture
@@ -1747,6 +1766,12 @@ class TestInlineMarkupBoundaries:
         wraps several words -- opens against punctuation rather than
         whitespace, so none of them pair.
 
+        ``two-time-ranges`` is evidence for the spaced form only.  Written
+        without the spaces -- ``12:30~13:00,14:00~15:00`` -- the same prose
+        still loses characters, because a tight ``~`` span asks only that its
+        content hold no whitespace; see
+        ``test_punctuation_flanked_sup_and_sub_still_pair``.
+
         One parameter is a characterization case with no detection power
         against this change: ``two-hyphen-ranges`` passes identically without
         it, because the substitution this change deleted rewrote ``-text-`` to
@@ -1795,6 +1820,12 @@ class TestInlineMarkupBoundaries:
                 "<cite>is this cited? yes</cite>",
                 id="citation-containing-question-mark",
             ),
+            pytest.param(
+                "the +new+'s value",
+                "the <ins>new</ins>'s value",
+                id="span-before-an-apostrophe",
+            ),
+            pytest.param("*+ins+*", "**<ins>ins</ins>**", id="single-token-in-bold"),
         ],
     )
     def test_genuine_markup_still_converts(
@@ -1825,6 +1856,14 @@ class TestInlineMarkupBoundaries:
                 "e<sup>x</sup> + e<sup>y</sup>",
                 id="two-superscripts-around-a-plus",
             ),
+            pytest.param(
+                "你好~sub~世界", "你好<sub>sub</sub>世界", id="chinese-subscript"
+            ),
+            pytest.param(
+                "面積は2^10^です",
+                "面積は2<sup>10</sup>です",
+                id="japanese-superscript",
+            ),
         ],
     )
     def test_intraword_superscript_and_subscript_convert(
@@ -1837,7 +1876,13 @@ class TestInlineMarkupBoundaries:
         to read them back would mean writing markup this library cannot parse
         (see ``test_sub_sup_and_ins_round_trip``).  It stays unambiguous
         because the span content may not contain whitespace, which is what
-        separates ``H~2~O`` from prose like ``x^2 plus y^2``.
+        separates ``H~2~O`` from prose like ``x^2 plus y^2`` -- and no further:
+        punctuation-flanked prose still pairs, see
+        ``test_punctuation_flanked_sup_and_sub_still_pair``.
+
+        Having no word-character condition is also why these two keep working
+        in scripts that do not separate words with spaces, where ``+`` and
+        ``??`` stop converting entirely.
         """
         assert preprocessor.jira_to_markdown(text) == expected
 
@@ -1857,8 +1902,45 @@ class TestInlineMarkupBoundaries:
         inserted text or citations.  The cost is a marker left visible rather
         than a mangled link, and the write path can produce such markup, so
         this is a deliberate one-way trade.
+
+        Both examples here are ASCII, where the spaced form ``+ins+`` remains
+        available.  That is not true everywhere; see
+        ``test_plus_and_citation_are_unconvertible_in_unspaced_scripts``.
         """
         assert preprocessor.jira_to_markdown(text) == text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            pytest.param("これは+挿入+です", id="japanese-inserted"),
+            pytest.param("これは??引用??です", id="japanese-citation"),
+            pytest.param(
+                "品質は+良い+。", id="japanese-inserted-before-ideographic-stop"
+            ),
+            pytest.param("café+ins+naïve", id="accented-latin-inserted"),
+        ],
+    )
+    def test_plus_and_citation_are_unconvertible_in_unspaced_scripts(
+        self, preprocessor, text: str
+    ):
+        """The word-character condition on ``+`` and ``??`` is a Unicode one.
+
+        Python's ``\\w`` covers every script, so a Japanese or Chinese span is
+        intraword by construction -- and that prose has no whitespace-delimited
+        alternative to fall back on.  For those languages the two markers stop
+        converting altogether rather than merely losing their intraword form:
+        every case here converted before this change and does not now.
+
+        It is a real cost, kept because the reason for the condition does not
+        depend on the script: ``+`` still joins words in a Confluence page path
+        and ``??`` is still null-coalescing code, and a Japanese enumeration
+        (``牛乳+パン+卵``) would be corrupted by the same rule that recovers
+        ``+挿入+``.  Markers left visible are lossless; eaten characters are
+        not.  ``^`` and ``~`` are unaffected -- see
+        ``test_intraword_superscript_and_subscript_convert``.
+        """
+        assert preprocessor.jira_to_markdown(text) == text
+        assert preprocessor.clean_jira_text(text) == text
 
     @pytest.mark.parametrize(
         "text",
@@ -1881,16 +1963,59 @@ class TestInlineMarkupBoundaries:
             ),
         ],
     )
-    def test_urls_keep_every_marker_character(self, preprocessor, text: str):
-        """No inline conversion ever reaches inside a URL.
+    def test_scheme_ful_urls_keep_every_marker_character(self, preprocessor, text: str):
+        """No inline conversion reaches inside a URL token that has a scheme.
 
         A rewritten marker turns a live link into a dead one, which is the
         headline symptom this module guards against.  The guard covers the
         still-unbounded italic pairing too, so a path with underscores stays
         clickable.
+
+        The scheme is what makes the token recognisable, and it is all the
+        guard recognises; see ``test_scheme_less_urls_are_not_protected``.
         """
         assert preprocessor.jira_to_markdown(text) == text
         assert preprocessor.clean_jira_text(text) == text
+
+    @pytest.mark.parametrize(
+        "text, expected, expected_clean",
+        [
+            pytest.param(
+                "www.ex.com/a_b_c",
+                "www.ex.com/a*b*c",
+                "www.ex.com/a*b*c",
+                id="underscores-in-a-bare-host-path",
+            ),
+            pytest.param(
+                "example.com/~user/~backup",
+                "example.com/<sub>user/</sub>backup",
+                "example.com/user/backup",
+                id="tildes-in-a-bare-host-path",
+            ),
+        ],
+    )
+    def test_scheme_less_urls_are_not_protected(
+        self, preprocessor, text: str, expected: str, expected_clean: str
+    ):
+        """Characterization test: a URL without a scheme is still rewritten.
+
+        ``_URL_TOKEN_PATTERN`` matches ``http(s)://`` and ``ftp://`` only, and
+        ``_sub_outside_urls`` short-circuits on text holding no ``://`` at all,
+        so these two come out as dead links.  Both assertions hold identically
+        without the boundary rules -- this is unchanged behaviour, recorded so
+        the guard is not read as covering every URL; the sibling test above
+        says scheme-ful in its name for the same reason.
+
+        The second parameter shows what that costs on the plain-text path,
+        where the tags are stripped again: ``example.com/~user/~backup`` is read
+        back as ``example.com/user/backup``, two characters short.
+
+        It is left as is rather than widened: nothing distinguishes a bare host
+        from a sentence, so protecting ``example.com/~user`` means guessing
+        where prose ends.
+        """
+        assert preprocessor.jira_to_markdown(text) == expected
+        assert preprocessor.clean_jira_text(text) == expected_clean
 
     def test_markup_wrapping_a_url_still_converts(self, preprocessor):
         """A span may still wrap a whole URL; only spans inside one are kept."""
@@ -1899,16 +2024,73 @@ class TestInlineMarkupBoundaries:
             == "<ins>https://ex.com/a</ins>"
         )
 
-    def test_multiword_span_against_punctuation_is_not_converted(self, preprocessor):
-        """A known, deliberate false negative.
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            pytest.param("(+two words+)", "(+two words+)", id="in-brackets"),
+            pytest.param("*+ins bold+*", "**+ins bold+**", id="nested-in-bold"),
+            pytest.param("|+two ok+|", "|+two ok+|", id="unpadded-table-cell"),
+            pytest.param(
+                "|+ok+|+two ok+|",
+                "|<ins>ok</ins>|+two ok+|",
+                id="unpadded-cells-tight-and-loose",
+            ),
+        ],
+    )
+    def test_multiword_span_against_punctuation_is_not_converted(
+        self, preprocessor, text: str, expected: str
+    ):
+        """Known, deliberate false negatives -- more than the bracketed one.
 
         A multi-word span has to open at the start of a line or after
         whitespace, because that is the only thing separating markup from
-        prose such as ``see "~/tmp" and "~/var"``.  ``(+two words+)`` pays for
-        that with a marker left visible -- lossless, unlike silently eating
-        the characters between two literal markers.
+        prose such as ``see "~/tmp" and "~/var"``.  Any punctuation in front of
+        the marker fails that, wherever it comes from: the user's own brackets,
+        an enclosing emphasis marker, or a table-cell pipe.  Each one pays with
+        a marker left visible -- lossless, unlike silently eating the
+        characters between two literal markers.  The tight, single-token form
+        keeps working in every one of those positions: the last parameter shows
+        both in one table row, and ``(+ok+)``, ``|+ok+|`` and ``*+ins+*`` are
+        pinned in ``test_genuine_markup_still_converts``.
         """
-        assert preprocessor.jira_to_markdown("(+two words+)") == "(+two words+)"
+        assert preprocessor.jira_to_markdown(text) == expected
+
+    def test_multiword_span_inside_a_macro_is_not_converted(self, preprocessor):
+        """The same false negative when the punctuation comes from a macro.
+
+        ``{color:red}`` closes with a brace, so the span behind it opens
+        against punctuation and stays literal.  The colour macro's own output
+        is asserted loosely on purpose: how ``{color}`` renders is another
+        rule's business, and the point here is only that the ``+`` markers
+        survive as text.
+        """
+        result = preprocessor.jira_to_markdown("{color:red}+two words+{color}")
+        assert "+two words+" in result
+        assert "<ins>" not in result
+
+        tight = preprocessor.jira_to_markdown("{color:red}+ins+{color}")
+        assert "<ins>ins</ins>" in tight
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            pytest.param("+word+s", id="inserted-then-word"),
+            pytest.param("??cited??s", id="citation-then-word"),
+        ],
+    )
+    def test_span_glued_to_the_following_word_is_not_converted(
+        self, preprocessor, text: str
+    ):
+        """A closing ``+`` or ``??`` may not be followed by a word character.
+
+        ``+word+s`` used to convert and no longer does, which is the price of
+        the symmetric rule that keeps ``?q=+foo+bar`` and other word-joining
+        text intact.  Only a directly suffixed span is affected: punctuation is
+        not a word character, so ``the +new+'s value`` still converts (see
+        ``test_genuine_markup_still_converts``).
+        """
+        assert preprocessor.jira_to_markdown(text) == text
+        assert preprocessor.clean_jira_text(text) == text
 
     @pytest.mark.parametrize(
         "text, expected",
@@ -1975,10 +2157,96 @@ class TestInlineMarkupBoundaries:
         assert result == r"\+" * 16383
         assert elapsed < 0.5, f"32 KB of escapes took {elapsed:.3f}s"
 
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            pytest.param(
+                "12:30~13:00,14:00~15:00",
+                "12:30<sub>13:00,14:00</sub>15:00",
+                id="comma-separated-time-ranges",
+            ),
+            pytest.param(
+                "12:30~13:00;14:00~15:00",
+                "12:30<sub>13:00;14:00</sub>15:00",
+                id="semicolon-separated-time-ranges",
+            ),
+            pytest.param(
+                "9:00~12:00、13:00~17:00",
+                "9:00<sub>12:00、13:00</sub>17:00",
+                id="ideographic-comma-separated-time-ranges",
+            ),
+            pytest.param(
+                "楽しみ9:00~12:00で14:00~17:00",
+                "楽しみ9:00<sub>12:00で14:00</sub>17:00",
+                id="japanese-time-ranges",
+            ),
+            pytest.param("x^2,y^2", "x<sup>2,y</sup>2", id="comma-separated-exponents"),
+            pytest.param("1.0~rc1~2", "1.0<sub>rc1</sub>2", id="version-with-tildes"),
+        ],
+    )
+    def test_punctuation_flanked_sup_and_sub_still_pair(
+        self, preprocessor, text: str, expected: str
+    ):
+        """Characterization test: the residual ``^``/``~`` corruption class.
+
+        Every assertion here holds identically without the boundary rules, so
+        none of them has detection power against this change.  They are here
+        because the change is easy to over-read: it fixes ``x^2 plus y^2`` and
+        ``12:30~13:00 and 14:00~15:00``, and it fixes nothing at all when the
+        neighbours are punctuation instead of spaces.  A tight ``^``/``~`` span
+        asks only that its content hold no whitespace, so ``~13:00,14:00~``
+        pairs exactly as before -- and ``clean_jira_text`` then drops the tags,
+        leaving ``12:3013:00,14:0015:00``, with the characters gone.
+
+        The rule is kept because nothing separates ``~13:00,14:00~`` from the
+        ``~2~`` in ``H~2~O``, which Jira renders and which
+        ``markdown_to_jira`` emits: closing this hole means refusing to read
+        back markup this library writes.  Anything narrower -- banning specific
+        punctuation inside the content, say -- would be a guess dressed up as a
+        rule, unverifiable against Atlassian's parser from here.
+        """
+        assert preprocessor.jira_to_markdown(text) == expected
+
     def test_spans_do_not_cross_a_line_break(self, preprocessor):
         """A marker on one line never pairs with a marker on the next."""
         text = "first ~line\nsecond~ line"
         assert preprocessor.jira_to_markdown(text) == text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            pytest.param("\x00ESC8\x00", id="index-past-the-table"),
+            pytest.param("\x00ESC12\x00", id="two-digit-index"),
+            pytest.param("\x00ESC0000000009\x00", id="zero-padded-index"),
+            pytest.param("desc \x00ESC12\x00 end", id="unknown-token-in-prose"),
+            pytest.param("\x00ESC7\x00", id="token-this-module-does-write"),
+            pytest.param("\x00ESC1\x00", id="plus-token"),
+            pytest.param("\x00ESC1\x00 and \\+", id="token-beside-a-real-escape"),
+            pytest.param("\x00NUL\x00", id="nul-token-itself"),
+            pytest.param("a\x00b", id="bare-nul"),
+        ],
+    )
+    def test_placeholder_shaped_field_text_survives(self, preprocessor, text: str):
+        r"""A field carrying the escape placeholders' own bytes reads back as is.
+
+        Escapes are held as \x00ESC<n>\x00 placeholders while the conversions
+        run, and a field can arrive already holding that sequence: JSON has an
+        escape for the NUL byte, so an API client can put one in a description
+        even though a browser cannot type it.  Restoring by an index parsed out
+        of the text made \x00ESC12\x00 raise IndexError from the read path --
+        any field, any caller -- and rewrote \x00ESC7\x00 into \- silently.
+
+        Now only whole tokens this module actually wrote are restored, and an
+        incoming NUL is itself tokenised first so it cannot open one.  The text
+        comes back byte for byte, as it did before escapes were handled at all.
+
+        The last two parameters carry no evidence about the old defect -- they
+        passed before it was fixed as well.  What they pin is that tokenising
+        the incoming NUL is exactly reversible, which is the part of the fix
+        that could regress quietly.
+        """
+        assert preprocessor.jira_to_markdown(text) == text
+        assert preprocessor.clean_jira_text(text) == text
 
     def test_strikethrough_marker_is_left_untouched(self, preprocessor):
         """``-text-`` is deliberately not converted.

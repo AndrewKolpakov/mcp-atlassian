@@ -33,7 +33,28 @@ _ESCAPED_CHAR_PATTERN = re.compile(
 _ESCAPE_PLACEHOLDERS = {
     char: f"\x00ESC{index}\x00" for index, char in enumerate(_ESCAPABLE_CHARS)
 }
-_ESCAPE_PLACEHOLDER_PATTERN = re.compile(r"\x00ESC(\d+)\x00")
+# The placeholders live in NUL, which no Jira field is meant to contain -- but
+# the JSON that carries a field can encode one, so the text may arrive already
+# holding something shaped like a placeholder.  Two rules keep that harmless.
+# Restoration matches whole known tokens only, never an index parsed out of the
+# text, so ``\x00ESC12\x00`` means nothing here and is left alone instead of
+# indexing off the end of ``_ESCAPABLE_CHARS``.  And every NUL arriving in the
+# text is itself replaced by a token first, so a literal ``\x00ESC7\x00`` is
+# not mistaken for the placeholder of ``\-``: both tokens are restored in one
+# left-to-right pass, where the NUL token consumes the NUL that would otherwise
+# open an escape placeholder, and the field reads back byte for byte.
+_NUL_PLACEHOLDER = "\x00NUL\x00"
+_PLACEHOLDER_RESTORATIONS: dict[str, str] = {
+    _NUL_PLACEHOLDER: "\x00",
+    **{placeholder: "\\" + char for char, placeholder in _ESCAPE_PLACEHOLDERS.items()},
+}
+# One literal prefix and one alternation of token bodies, so marker-free text
+# costs a single scan for NUL rather than one attempt per token.
+_PLACEHOLDER_PATTERN = re.compile(
+    "\x00(?:"
+    + "|".join(re.escape(token[1:-1]) for token in _PLACEHOLDER_RESTORATIONS)
+    + ")\x00"
+)
 
 # A URL is a single token that has to survive the read path byte for byte: a
 # marker converted inside one produces a dead link, which is the reason this
@@ -42,6 +63,14 @@ _ESCAPE_PLACEHOLDER_PATTERN = re.compile(r"\x00ESC(\d+)\x00")
 # their plus signs.  A trailing marker, sentence punctuation or placeholder is
 # left outside the token, so markup *wrapping* a whole URL still converts, as
 # in ``+https://example.com/a+.``
+#
+# Only a token with an explicit scheme is recognised, and ``_sub_outside_urls``
+# short-circuits on text with no ``://`` at all, so a bare host is not covered:
+# ``www.example.com/a_b_c`` still italicises and ``example.com/~user/~backup``
+# still subscripts, both of them dead links.  That is unchanged behaviour, not
+# something the flanking rules address -- a boundary rule cannot tell a host
+# name from a sentence, and widening the guard to bare hosts would have to
+# guess at where prose ends.
 _URL_TOKEN_PATTERN = re.compile(
     r"(?:https?|ftp)://\S*[^\s+*_~^?.,;:!\x00]", re.IGNORECASE
 )
@@ -59,21 +88,50 @@ _URL_TOKEN_PATTERN = re.compile(
 # reason (see ``escape_intraword_underscore_runs``).  Bounding the read side
 # would break fidelity with Jira's renderer rather than restore it.
 #
-# Neither marker may reach into a URL; ``_sub_outside_urls`` enforces that.
+# Neither marker may reach into a scheme-ful URL; ``_sub_outside_urls``
+# enforces that, with the limits noted on ``_URL_TOKEN_PATTERN``.
 _BOLD_ITALIC_PATTERN = re.compile(r"\*(?!\s)(.*?)(?<!\s)\*|_(.*?)_")
 
 
 def _protect_escaped_chars(text: str) -> str:
-    r"""Replace every ``\c`` escape with a per-character placeholder."""
+    r"""Replace every ``\c`` escape with a per-character placeholder.
+
+    Any NUL already in the text is replaced first, so a field that happens to
+    carry a placeholder-shaped byte sequence cannot be confused with a
+    placeholder this function wrote (see ``_NUL_PLACEHOLDER``).  The code and
+    inline-code placeholders that ``_extract_blocks`` inserted upstream are
+    built from NUL as well, so they are tokenised here too and come back intact
+    in ``_restore_escaped_chars``, which runs before the blocks are restored.
+
+    Args:
+        text: Text in Jira wiki markup, straight from the field.
+
+    Returns:
+        Text with every escape, and every NUL, replaced by a placeholder.
+    """
+    text = text.replace("\x00", _NUL_PLACEHOLDER)
     return _ESCAPED_CHAR_PATTERN.sub(
         lambda match: _ESCAPE_PLACEHOLDERS[match.group(1)], text
     )
 
 
 def _restore_escaped_chars(text: str) -> str:
-    """Turn escape placeholders back into markdown escapes."""
-    return _ESCAPE_PLACEHOLDER_PATTERN.sub(
-        lambda match: "\\" + _ESCAPABLE_CHARS[int(match.group(1))], text
+    """Turn escape placeholders back into markdown escapes, NUL tokens into NUL.
+
+    Only whole tokens this module writes are restored; a placeholder-shaped
+    sequence that came in with the text matches none of them and is left as it
+    was.
+
+    Args:
+        text: Text whose escapes are still held as placeholders.
+
+    Returns:
+        Text with escapes back as ``\\c`` and any NUL back as itself.
+    """
+    if "\x00" not in text:
+        return text
+    return _PLACEHOLDER_PATTERN.sub(
+        lambda match: _PLACEHOLDER_RESTORATIONS[match.group(0)], text
     )
 
 
@@ -84,7 +142,10 @@ def _sub_outside_urls(
     *,
     marker_length: int = 1,
 ) -> str:
-    """Substitute ``pattern`` except where a delimiter sits inside a URL.
+    """Substitute ``pattern`` except where a delimiter sits inside a URL token.
+
+    A URL token means one with an explicit scheme; a scheme-less
+    ``www.example.com/a_b_c`` is not protected (see ``_URL_TOKEN_PATTERN``).
 
     Args:
         pattern: Compiled pattern whose match starts and ends with a marker.
@@ -93,7 +154,7 @@ def _sub_outside_urls(
         marker_length: Length of the closing marker, used to locate it.
 
     Returns:
-        Text with every match delimited outside a URL token replaced.
+        Text with every match delimited outside a scheme-ful URL replaced.
     """
     # Fast path: no scheme, so no URL to protect.  Worth the check because
     # this runs once per marker per field on every issue read.
@@ -137,14 +198,47 @@ def _inline_markup_pattern(marker: str, *, intraword: bool) -> re.Pattern[str]:
     * A *loose* span, whose content holds whitespace -- ``+two words+``.  It
       must open at the start of a line or after whitespace, so prose whose
       markers merely hug punctuation keeps them: ``[+] done and [+] pending``,
-      ``see "~/tmp" and "~/var"``, ``(+/-) (+/-)``.  The cost is a missed
-      ``(+two words+)`` -- a marker left visible, not text silently eaten.
+      ``see "~/tmp" and "~/var"``, ``(+/-) (+/-)``.
 
     Either way the opening marker hugs its content, the closing marker hugs
     its content and is not followed by a word character, and the content never
     contains the marker.  Prose such as ``x^2 plus y^2``, ``date + 4 weeks``,
     ``12:30~13:00 and 14:00~15:00`` or ``cost $5+$6 and $7+$8`` therefore
     survives untouched instead of losing characters to a stray second marker.
+
+    What that costs, in full -- every one of these is markup Jira renders and
+    this function declines, and every one of them leaves its markers visible
+    rather than eating text:
+
+    * The word-character condition on ``+`` and ``??`` is a Unicode one, so in
+      a script written without spaces between words every span is intraword
+      and neither marker converts *at all*.  ``これは+挿入+です`` and
+      ``これは??引用??です`` come back unchanged, and there is no
+      whitespace-delimited alternative in that prose to fall back on, so for
+      those languages the loss is total rather than merely intraword; the same
+      goes for accented Latin, where ``café+ins+naïve`` keeps its markers.
+      ``^`` and ``~`` are unaffected, since their intraword arm has no
+      word-character condition (``你好~sub~世界`` still converts).
+    * A loose span must open at the start of a line or after whitespace, which
+      no punctuation satisfies: ``(+two words+)``, a span wrapped in a macro
+      (``{color:red}+two words+{color}``), a span nested inside emphasis
+      (``*+ins bold+*``) and a span in an unpadded table cell (``|+two ok+|``)
+      are all left alone.  Only the whitespace-padded forms (``| cell +ins+ |``)
+      and single tokens (``|+ok+|``) convert.
+    * The closing marker may not be followed by a word character, so a span
+      glued to the next word -- ``+word+s`` -- does not convert either.  That
+      is the symmetric price of protecting ``?q=+foo+bar``; a following
+      apostrophe or punctuation is not a word character, so ``the +new+'s``
+      still converts.
+
+    And what it does *not* fix, for ``^`` and ``~``: their tight arm asks only
+    that the content hold no whitespace, so a pair whose neighbours are
+    punctuation still pairs across prose exactly as before -- ``x^2,y^2``,
+    ``12:30~13:00,14:00~15:00``, ``9:00~12:00、13:00~17:00`` and ``1.0~rc1~2``
+    all lose characters.  Only the space-separated forms are protected.  The
+    corruption class is narrowed for these two markers, not closed: nothing
+    distinguishes ``~13:00,14:00~`` from ``~2~`` in ``H~2~O``, which Jira
+    renders and this library writes.
 
     Args:
         marker: Literal wiki marker delimiting the span, e.g. ``"+"``.
@@ -495,8 +589,9 @@ class JiraPreprocessor(BasePreprocessor):
 
         # Text formatting (bold, italic).  Bold requires a non-space on the
         # inside of each marker; italic pairing stays unbounded, matching
-        # Jira's own renderer.  Both stop at URL boundaries, so a link with
-        # underscores in its path stays clickable.  See _BOLD_ITALIC_PATTERN.
+        # Jira's own renderer.  Both stop at the boundary of a scheme-ful URL,
+        # so a link with underscores in its path stays clickable.  See
+        # _BOLD_ITALIC_PATTERN and _URL_TOKEN_PATTERN.
         output = _sub_outside_urls(_BOLD_ITALIC_PATTERN, _wrap_bold_or_italic, output)
 
         # Multi-level numbered list
