@@ -7,11 +7,15 @@ Supports both ADF → plain text (for reading) and Markdown → ADF (for writing
 
 import copy
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 _MEDIA_NODE_TYPES = frozenset({"media", "mediaSingle", "mediaGroup"})
+_TABLE_SEPARATOR_RE = re.compile(r"^:?-+:?$")
 _JIRA_ISSUE_KEY_RE = re.compile(
     r"(?<![A-Za-z0-9_/-])"
     r"([A-Z][A-Z0-9_]+-\d+(?:-\d+)*)"
@@ -214,12 +218,160 @@ def _make_task_item(
     }
 
 
+def _split_table_cells(text: str, delimiter: str) -> list[str]:
+    """Split a table row on a delimiter, ignoring code spans and link targets.
+
+    Delimiters inside a backtick code span (``a || b``) or inside a Markdown
+    link target (``[text](https://x/a||b)``) are literal characters, not cell
+    separators. An unterminated backtick is treated as a literal character.
+
+    Args:
+        text: Row body with the outer delimiters already removed.
+        delimiter: Cell delimiter to split on (``"|"`` or ``"||"``).
+
+    Returns:
+        List of raw (unstripped) cell strings; always at least one item.
+    """
+    cells: list[str] = []
+    buffer: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "`":
+            closing = text.find("`", index + 1)
+            if closing != -1:
+                buffer.append(text[index : closing + 1])
+                index = closing + 1
+                continue
+        elif text.startswith("](", index):
+            closing = text.find(")", index + 2)
+            if closing != -1:
+                buffer.append(text[index : closing + 1])
+                index = closing + 1
+                continue
+        elif text.startswith(delimiter, index):
+            cells.append("".join(buffer))
+            buffer = []
+            index += len(delimiter)
+            continue
+        buffer.append(char)
+        index += 1
+    cells.append("".join(buffer))
+    return cells
+
+
+def _wiki_table_row_cells(line: str) -> list[str] | None:
+    """Split a Jira wiki table header row (``||a||b||``) into cell texts.
+
+    Jira's wiki markup marks header cells with ``||`` while Markdown uses a
+    single ``|`` everywhere, so a wiki header fed to the Markdown splitter
+    yields ``2N - 1`` cells for ``N`` columns. Detection is deliberately
+    narrow: the row must start with ``||`` and either end with ``||`` or carry
+    a further top-level ``||``. Prose such as ``|| means logical or`` and
+    Markdown rows with an empty first cell (``|| b | c |``) are therefore left
+    to the Markdown path.
+
+    Args:
+        line: Single table line, still including its outer pipes.
+
+    Returns:
+        Stripped cell texts, or None when the line is not a wiki header row.
+    """
+    stripped = line.strip()
+    if not stripped.startswith("||"):
+        return None
+
+    body = stripped[2:]
+    closed = body.endswith("||")
+    body = body[:-2] if closed else body.rstrip("|")
+    cells = _split_table_cells(body, "||")
+    if not closed and len(cells) < 2:
+        return None
+    return [cell.strip() for cell in cells]
+
+
+def _build_table_node(
+    table_lines: list[str], jira_base_url: str = ""
+) -> dict[str, Any] | None:
+    """Build an ADF table node from Markdown or Jira wiki table lines.
+
+    Each row is parsed in its own dialect: rows written as ``||a||b||`` are
+    split on ``||`` and become header cells, every other row is split on a
+    single ``|``. Markdown alignment separators (``|---|:---:|``) are dropped.
+    Rows that still disagree on width are padded with empty cells so the ADF
+    table stays rectangular, and a single warning per table reports it.
+
+    Args:
+        table_lines: Consecutive lines forming one table block.
+        jira_base_url: Jira base URL used to link bare issue keys.
+
+    Returns:
+        ADF table node, or None when every line was a separator.
+    """
+    wiki_rows = [_wiki_table_row_cells(line) for line in table_lines]
+    has_wiki_header = any(cells is not None for cells in wiki_rows)
+
+    parsed_rows: list[tuple[bool, list[str]]] = []
+    for line, wiki_cells in zip(table_lines, wiki_rows, strict=True):
+        if wiki_cells is not None:
+            cells = wiki_cells
+        elif has_wiki_header:
+            cells = [c.strip() for c in _split_table_cells(line.strip("|"), "|")]
+        else:
+            cells = [c.strip() for c in line.strip("|").split("|")]
+        if all(_TABLE_SEPARATOR_RE.match(c) for c in cells if c):
+            continue
+        parsed_rows.append((wiki_cells is not None, cells))
+
+    if not parsed_rows:
+        return None
+
+    if has_wiki_header:
+        logger.debug("Parsed %d wiki-markup table row(s)", len(parsed_rows))
+
+    widths = {len(cells) for _, cells in parsed_rows}
+    column_count = max(widths)
+    if len(widths) > 1:
+        logger.warning(
+            "Table rows have mismatched column counts %s; "
+            "padding every row to %d columns",
+            sorted(widths),
+            column_count,
+        )
+
+    adf_rows: list[dict[str, Any]] = []
+    for idx, (is_wiki_row, cells) in enumerate(parsed_rows):
+        is_header = is_wiki_row if has_wiki_header else idx == 0
+        cell_type = "tableHeader" if is_header else "tableCell"
+        padded = cells + [""] * (column_count - len(cells))
+        adf_cells = []
+        for cell_text in padded:
+            content = _parse_inline_formatting(cell_text, jira_base_url)
+            if not content:
+                content = [{"type": "text", "text": ""}]
+            adf_cells.append(
+                {
+                    "type": cell_type,
+                    "content": [{"type": "paragraph", "content": content}],
+                }
+            )
+        adf_rows.append({"type": "tableRow", "content": adf_cells})
+
+    return {
+        "type": "table",
+        "attrs": {"isNumberColumnEnabled": False, "layout": "default"},
+        "content": adf_rows,
+    }
+
+
 def markdown_to_adf(markdown_text: str, jira_base_url: str = "") -> dict[str, Any]:
     """Convert Markdown text to ADF (Atlassian Document Format) document.
 
     Implements a line-by-line parser that handles common Markdown constructs.
     Jira Cloud expand blocks can be written as
-    ``{expand:Title}...{expand}``. No external dependencies required.
+    ``{expand:Title}...{expand}``. Table rows pasted as Jira wiki markup
+    (``||header||header||``) are recognised alongside Markdown pipe tables.
+    No external dependencies required.
 
     Args:
         markdown_text: Markdown-formatted text to convert.
@@ -398,45 +550,16 @@ def markdown_to_adf(markdown_text: str, jira_base_url: str = "") -> dict[str, An
             doc["content"].append({"type": "orderedList", "content": items_ol})
             continue
 
-        # --- Table ---
+        # --- Table (Markdown "|a|b|" or Jira wiki "||a||b||") ---
         if line.startswith("|") and "|" in line[1:]:
-            table_rows: list[str] = []
+            table_lines: list[str] = []
             while i < len(lines) and lines[i].startswith("|"):
-                table_rows.append(lines[i])
+                table_lines.append(lines[i])
                 i += 1
 
-            # Parse rows, skip separator (|---|---|)
-            data_rows: list[list[str]] = []
-            for row_line in table_rows:
-                cells = [c.strip() for c in row_line.strip("|").split("|")]
-                if all(re.match(r"^:?-+:?$", c) for c in cells if c):
-                    continue
-                data_rows.append(cells)
-
-            if data_rows:
-                adf_rows: list[dict[str, Any]] = []
-                for idx, cells in enumerate(data_rows):
-                    cell_type = "tableHeader" if idx == 0 else "tableCell"
-                    adf_cells = []
-                    for cell_text in cells:
-                        content = _parse_inline_formatting(cell_text, jira_base_url)
-                        if not content:
-                            content = [{"type": "text", "text": ""}]
-                        adf_cells.append(
-                            {
-                                "type": cell_type,
-                                "content": [{"type": "paragraph", "content": content}],
-                            }
-                        )
-                    adf_rows.append({"type": "tableRow", "content": adf_cells})
-
-                doc["content"].append(
-                    {
-                        "type": "table",
-                        "attrs": {"isNumberColumnEnabled": False, "layout": "default"},
-                        "content": adf_rows,
-                    }
-                )
+            table_node = _build_table_node(table_lines, jira_base_url)
+            if table_node is not None:
+                doc["content"].append(table_node)
             continue
 
         # --- Empty line (skip) ---

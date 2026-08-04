@@ -6,6 +6,7 @@ including handling of various inline and block node types,
 and the reverse conversion from Markdown to ADF.
 """
 
+import logging
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -815,6 +816,306 @@ class TestMarkdownToAdf:
         table = next(n for n in result["content"] if n["type"] == "table")
         # Should have 2 rows: header + 1 data (separator skipped)
         assert len(table["content"]) == 2
+
+    # -- Jira wiki tables ---------------------------------------------------
+
+    @staticmethod
+    def _row_texts(row: dict[str, Any]) -> list[str]:
+        """Return the first text value of every cell in an ADF table row."""
+        return [c["content"][0]["content"][0]["text"] for c in row["content"]]
+
+    @staticmethod
+    def _column_counts(table: dict[str, Any]) -> list[int]:
+        """Return the cell count of every row in an ADF table."""
+        return [len(row["content"]) for row in table["content"]]
+
+    @staticmethod
+    def _column_count_warnings(records: list[logging.LogRecord]) -> list[str]:
+        """Return warning messages emitted about mismatched column counts."""
+        return [
+            r.getMessage()
+            for r in records
+            if r.levelno == logging.WARNING and "column counts" in r.getMessage()
+        ]
+
+    def test_wiki_table_header_column_count_matches_data_rows(self) -> None:
+        """Wiki '||h||h||' header yields N cells, not the 2N-1 ragged split."""
+        md = "||Name||Age||City||\n|Alice|30|Paris|\n|Bob|25|Rome|"
+        result = markdown_to_adf(md)
+        table = next(n for n in result["content"] if n["type"] == "table")
+
+        assert self._column_counts(table) == [3, 3, 3]
+        header_row = table["content"][0]
+        assert all(c["type"] == "tableHeader" for c in header_row["content"])
+        assert self._row_texts(header_row) == ["Name", "Age", "City"]
+        assert all(c["type"] == "tableCell" for c in table["content"][1]["content"])
+        assert self._row_texts(table["content"][1]) == ["Alice", "30", "Paris"]
+        assert self._row_texts(table["content"][2]) == ["Bob", "25", "Rome"]
+
+    def test_wiki_table_single_column(self) -> None:
+        """A one-column wiki header '||Only||' produces a single header cell."""
+        md = "||Only||\n|value|"
+        result = markdown_to_adf(md)
+        table = next(n for n in result["content"] if n["type"] == "table")
+        assert self._column_counts(table) == [1, 1]
+        assert self._row_texts(table["content"][0]) == ["Only"]
+
+    def test_wiki_table_unterminated_header_row(self) -> None:
+        """A wiki header missing its trailing '||' still yields N columns."""
+        md = "||Name||Age\n|Alice|30|"
+        result = markdown_to_adf(md)
+        table = next(n for n in result["content"] if n["type"] == "table")
+        assert self._column_counts(table) == [2, 2]
+        assert self._row_texts(table["content"][0]) == ["Name", "Age"]
+
+    def test_wiki_table_later_header_row_is_a_header(self) -> None:
+        """Every '||...||' row is a header row, other rows are data cells."""
+        md = "||A||B||\n|1|2|\n||C||D||\n|3|4|"
+        result = markdown_to_adf(md)
+        table = next(n for n in result["content"] if n["type"] == "table")
+        cell_types = [row["content"][0]["type"] for row in table["content"]]
+        assert cell_types == [
+            "tableHeader",
+            "tableCell",
+            "tableHeader",
+            "tableCell",
+        ]
+
+    def test_wiki_table_cells_keep_inline_formatting(self) -> None:
+        """Inline Markdown inside wiki cells is still converted to marks."""
+        md = "||**Feature**||Status||\n|Auth|`done`|"
+        result = markdown_to_adf(md)
+        table = next(n for n in result["content"] if n["type"] == "table")
+        header_content = table["content"][0]["content"][0]["content"][0]["content"]
+        assert header_content[0]["text"] == "Feature"
+        assert header_content[0]["marks"] == [{"type": "strong"}]
+        data_content = table["content"][1]["content"][1]["content"][0]["content"]
+        assert data_content[0]["marks"] == [{"type": "code"}]
+
+    def test_wiki_table_cells_link_issue_keys(self) -> None:
+        """Wiki cells go through the same issue-key linking as Markdown cells."""
+        md = "||Key||\n|ABC-1|"
+        result = markdown_to_adf(md, "https://jira.example.com")
+        table = next(n for n in result["content"] if n["type"] == "table")
+        node = table["content"][1]["content"][0]["content"][0]["content"][0]
+        assert node["marks"] == [
+            {
+                "type": "link",
+                "attrs": {"href": "https://jira.example.com/browse/ABC-1"},
+            }
+        ]
+
+    def test_wiki_table_separator_row_is_skipped(self) -> None:
+        """A '||---||---||' separator row is dropped, like its Markdown twin."""
+        md = "||A||B||\n||---||---||\n|1|2|"
+        result = markdown_to_adf(md)
+        table = next(n for n in result["content"] if n["type"] == "table")
+        assert self._column_counts(table) == [2, 2]
+        assert self._row_texts(table["content"][1]) == ["1", "2"]
+
+    def test_wiki_table_double_pipe_in_code_span_is_not_a_delimiter(self) -> None:
+        """'||' inside a code span does not split a wiki cell."""
+        md = "||`a || b`||Note||\n|x|y|"
+        result = markdown_to_adf(md)
+        table = next(n for n in result["content"] if n["type"] == "table")
+        assert self._column_counts(table) == [2, 2]
+        assert self._row_texts(table["content"][0]) == ["a || b", "Note"]
+
+    def test_wiki_table_double_pipe_in_link_target_is_not_a_delimiter(self) -> None:
+        """'||' inside a Markdown link target does not split a wiki cell."""
+        md = "||[docs](https://e.example.com/a||b)||Note||\n|1|2|"
+        result = markdown_to_adf(md)
+        table = next(n for n in result["content"] if n["type"] == "table")
+        assert self._column_counts(table) == [2, 2]
+        first_cell = table["content"][0]["content"][0]["content"][0]["content"][0]
+        assert first_cell["text"] == "docs"
+        assert first_cell["marks"] == [
+            {
+                "type": "link",
+                "attrs": {"href": "https://e.example.com/a||b"},
+            }
+        ]
+
+    def test_wiki_table_pipe_in_data_row_code_span_is_not_a_delimiter(self) -> None:
+        """A single '|' inside a code span keeps a wiki data row intact."""
+        md = "||Cmd||Note||\n|`a | b`|works|"
+        result = markdown_to_adf(md)
+        table = next(n for n in result["content"] if n["type"] == "table")
+        assert self._column_counts(table) == [2, 2]
+        assert self._row_texts(table["content"][1]) == ["a | b", "works"]
+
+    # -- Wiki detection false positives -------------------------------------
+
+    def test_double_pipe_in_prose_is_not_a_table(self) -> None:
+        """Prose containing '||' stays a paragraph."""
+        result = markdown_to_adf("Use a || b for logical OR")
+        assert [n["type"] for n in result["content"]] == ["paragraph"]
+        assert result["content"][0]["content"][0]["text"] == "Use a || b for logical OR"
+
+    def test_double_pipe_in_inline_code_is_not_a_table(self) -> None:
+        """'||' inside inline code stays a paragraph with a code mark."""
+        result = markdown_to_adf("Compare with `a || b` today")
+        assert [n["type"] for n in result["content"]] == ["paragraph"]
+        code_nodes = [
+            n
+            for n in result["content"][0]["content"]
+            if any(m["type"] == "code" for m in n.get("marks", []))
+        ]
+        assert [n["text"] for n in code_nodes] == ["a || b"]
+
+    def test_double_pipe_in_fenced_code_block_is_not_a_table(self) -> None:
+        """Wiki table lines inside a fenced code block are left verbatim."""
+        md = "```\n||A||B||\n|1|2|\n```"
+        result = markdown_to_adf(md)
+        assert [n["type"] for n in result["content"]] == ["codeBlock"]
+        assert result["content"][0]["content"][0]["text"] == "||A||B||\n|1|2|"
+
+    def test_leading_double_pipe_without_second_delimiter_is_not_wiki(self) -> None:
+        """'|| text' has no second '||', so Markdown parsing is unchanged."""
+        result = markdown_to_adf("|| not really a table")
+        table = next(n for n in result["content"] if n["type"] == "table")
+        assert self._column_counts(table) == [1]
+        assert self._row_texts(table["content"][0]) == ["not really a table"]
+
+    def test_markdown_row_with_empty_first_cell_is_not_wiki(self) -> None:
+        """'|| b | c |' is a Markdown row with an empty first cell, not wiki."""
+        md = "|| b | c |\n|---|---|\n| 1 | 2 |"
+        result = markdown_to_adf(md)
+        table = next(n for n in result["content"] if n["type"] == "table")
+        assert self._column_counts(table) == [2, 2]
+        assert self._row_texts(table["content"][0]) == ["b", "c"]
+
+    # -- Ragged tables ------------------------------------------------------
+
+    def test_ragged_wiki_table_is_padded_and_warns_once(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A short wiki data row is padded, with one warning for the table."""
+        md = "||A||B||C||\n|1|2|\n|3|4|"
+        with caplog.at_level(logging.WARNING):
+            result = markdown_to_adf(md)
+
+        table = next(n for n in result["content"] if n["type"] == "table")
+        assert self._column_counts(table) == [3, 3, 3]
+        assert self._row_texts(table["content"][1]) == ["1", "2", ""]
+        warnings = self._column_count_warnings(caplog.records)
+        assert len(warnings) == 1
+        assert "[2, 3]" in warnings[0]
+        assert "3 columns" in warnings[0]
+
+    def test_ragged_markdown_table_is_padded_and_warns_once(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Ragged Markdown rows are padded once per table, not once per row."""
+        md = "| a | b | c |\n|---|---|---|\n| 1 |\n| 2 |"
+        with caplog.at_level(logging.WARNING):
+            result = markdown_to_adf(md)
+
+        table = next(n for n in result["content"] if n["type"] == "table")
+        assert self._column_counts(table) == [3, 3, 3]
+        assert self._row_texts(table["content"][1]) == ["1", "", ""]
+        assert len(self._column_count_warnings(caplog.records)) == 1
+
+    def test_wiki_table_wider_data_row_pads_the_header(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A data row wider than the header pads the header, not truncates."""
+        md = "||A||B||\n|1|2|3|"
+        with caplog.at_level(logging.WARNING):
+            result = markdown_to_adf(md)
+
+        table = next(n for n in result["content"] if n["type"] == "table")
+        assert self._column_counts(table) == [3, 3]
+        assert self._row_texts(table["content"][0]) == ["A", "B", ""]
+        assert self._row_texts(table["content"][1]) == ["1", "2", "3"]
+        assert len(self._column_count_warnings(caplog.records)) == 1
+
+    def test_wiki_table_inside_expand_block(self) -> None:
+        """Wiki tables are recognised in recursively parsed blocks too."""
+        md = "{expand:Rooms}\n||Room||Floor||\n|101|1|\n{expand}"
+        result = markdown_to_adf(md)
+        expand = next(n for n in result["content"] if n["type"] == "expand")
+        table = next(n for n in expand["content"] if n["type"] == "table")
+        assert self._column_counts(table) == [2, 2]
+        assert self._row_texts(table["content"][0]) == ["Room", "Floor"]
+
+    def test_well_formed_tables_emit_no_column_count_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Rectangular tables in either dialect log no warning."""
+        with caplog.at_level(logging.WARNING):
+            markdown_to_adf("| a | b |\n|---|---|\n| 1 | 2 |")
+            markdown_to_adf("||A||B||\n|1|2|")
+
+        assert self._column_count_warnings(caplog.records) == []
+
+    def test_markdown_table_output_unchanged_by_wiki_support(self) -> None:
+        """A well-formed Markdown table converts exactly as it did before."""
+        md = "| Name | Age |\n|---|---|\n| Alice | 30 |"
+        assert markdown_to_adf(md) == {
+            "version": 1,
+            "type": "doc",
+            "content": [
+                {
+                    "type": "table",
+                    "attrs": {"isNumberColumnEnabled": False, "layout": "default"},
+                    "content": [
+                        {
+                            "type": "tableRow",
+                            "content": [
+                                {
+                                    "type": "tableHeader",
+                                    "content": [
+                                        {
+                                            "type": "paragraph",
+                                            "content": [
+                                                {"type": "text", "text": "Name"}
+                                            ],
+                                        }
+                                    ],
+                                },
+                                {
+                                    "type": "tableHeader",
+                                    "content": [
+                                        {
+                                            "type": "paragraph",
+                                            "content": [
+                                                {"type": "text", "text": "Age"}
+                                            ],
+                                        }
+                                    ],
+                                },
+                            ],
+                        },
+                        {
+                            "type": "tableRow",
+                            "content": [
+                                {
+                                    "type": "tableCell",
+                                    "content": [
+                                        {
+                                            "type": "paragraph",
+                                            "content": [
+                                                {"type": "text", "text": "Alice"}
+                                            ],
+                                        }
+                                    ],
+                                },
+                                {
+                                    "type": "tableCell",
+                                    "content": [
+                                        {
+                                            "type": "paragraph",
+                                            "content": [{"type": "text", "text": "30"}],
+                                        }
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
 
     # -- Roundtrip ----------------------------------------------------------
 
