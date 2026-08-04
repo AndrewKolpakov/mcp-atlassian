@@ -219,3 +219,51 @@ class TestJiraSearchResult:
         result = JiraSearchResult.from_api_response(mock_data)
         simplified = result.to_simplified_dict()
         assert "next_page_token" not in simplified
+
+    @staticmethod
+    def _result_with_null_custom_fields(requested_fields: str) -> dict:
+        """Build a one-issue search result carrying two null custom fields."""
+        response = {
+            "startAt": 0,
+            "maxResults": 1,
+            "total": 1,
+            "issues": [
+                {
+                    "id": "1",
+                    "key": "PROJ-1",
+                    "fields": {
+                        "summary": "Search hit",
+                        "customfield_10100": None,
+                        "customfield_10200": None,
+                        "customfield_10300": "kept",
+                    },
+                }
+            ],
+        }
+        result = JiraSearchResult.from_api_response(
+            response,
+            base_url="https://example.atlassian.net",
+            requested_fields=requested_fields,
+        )
+        issue = result.issues[0].to_simplified_dict()
+        return {k: v for k, v in issue.items() if k.startswith("customfield_")}
+
+    def test_search_drops_null_custom_fields_for_all(self):
+        """`*all` over a search hit omits the null custom fields."""
+        assert self._result_with_null_custom_fields("*all") == {
+            "customfield_10300": {"value": "kept"}
+        }
+
+    def test_search_keeps_explicitly_requested_null_custom_field(self):
+        """A field named in `fields` is reported even when null.
+
+        `jira_search`'s tool description promises this, and the search path
+        reaches the model through JiraSearchResult rather than directly, so the
+        promise is pinned here as well as at the model level: a `requested_fields`
+        that never arrived would make the description a lie no model-level test
+        could catch.
+        """
+        for spelling in ("customfield_10100", "cf_10100"):
+            assert self._result_with_null_custom_fields(spelling) == {
+                "customfield_10100": {"value": None}
+            }, spelling

@@ -92,6 +92,7 @@ class JiraIssue(ApiModel, TimestampMixin):
     worklog: dict | None = None
     changelogs: list[JiraChangelog] = Field(default_factory=list)
     issuelinks: list[JiraIssueLink] = Field(default_factory=list)
+    rendered_fields: dict[str, Any] | None = None
 
     def __getattribute__(self, name: str) -> Any:
         """
@@ -424,6 +425,12 @@ class JiraIssue(ApiModel, TimestampMixin):
                 for history in changelogs_data["histories"]
             ]
 
+        # Handling rendered fields (only returned for expand=renderedFields)
+        rendered_fields_data = data.get("renderedFields")
+        rendered_fields = (
+            rendered_fields_data if isinstance(rendered_fields_data, dict) else None
+        )
+
         # Handling attachments
         attachments = []
         attachments_data = fields.get("attachment", [])
@@ -471,14 +478,13 @@ class JiraIssue(ApiModel, TimestampMixin):
                     value_obj_to_store["name"] = human_readable_name
                 custom_fields[orig_field_id] = value_obj_to_store
 
-        # Handle requested_fields parameter
-        requested_fields_param = kwargs.get("requested_fields")
-
-        # Convert string requested_fields to list (except "*all")
-        if isinstance(requested_fields_param, str) and requested_fields_param != "*all":
-            requested_fields_param = requested_fields_param.split(",")
-            # Strip whitespace from each field name
-            requested_fields_param = [field.strip() for field in requested_fields_param]
+        # Handle requested_fields parameter. Both sides of this merge normalized
+        # the selector; _normalize_requested_fields is the general form -- it
+        # drops blank entries and honours "*all" wherever it appears, including
+        # inside a list, which the inlined version only did for a lone entry.
+        requested_fields_param = cls._normalize_requested_fields(
+            kwargs.get("requested_fields")
+        )
 
         # Create the issue instance with all the extracted data
         return cls(
@@ -517,7 +523,47 @@ class JiraIssue(ApiModel, TimestampMixin):
             requested_fields=requested_fields_param,
             changelogs=changelogs,
             issuelinks=cls._extract_issue_links(fields),
+            rendered_fields=rendered_fields,
         )
+
+    @staticmethod
+    def _normalize_requested_fields(requested_fields: Any) -> Any:
+        """Normalize a ``requested_fields`` selector into a canonical form.
+
+        Accepts the shapes callers actually pass: ``"*all"``, a
+        comma-separated string, a collection of field names (whose entries may
+        themselves be comma-separated), or ``None``. Comma-separated entries
+        are split and trimmed, so a single-element list such as
+        ``["summary,customfield_10011"]`` selects two fields instead of none,
+        and ``"*all"`` is honoured wherever it appears.
+
+        Args:
+            requested_fields: The raw selector supplied by the caller.
+
+        Returns:
+            ``"*all"``, a list of individual field names, ``None``, or the
+            value unchanged when it is of an unsupported type (left for model
+            validation to reject).
+        """
+        if requested_fields is None:
+            return None
+        if isinstance(requested_fields, str):
+            raw_entries: list[str] = [requested_fields]
+        elif isinstance(requested_fields, list | tuple | set):
+            raw_entries = [
+                entry for entry in requested_fields if isinstance(entry, str)
+            ]
+        else:
+            return requested_fields
+
+        entries: list[str] = []
+        for raw_entry in raw_entries:
+            entries.extend(part.strip() for part in raw_entry.split(","))
+        entries = [entry for entry in entries if entry]
+
+        if "*all" in entries:
+            return "*all"
+        return entries
 
     def to_simplified_dict(self) -> dict[str, Any]:
         """Convert to simplified dictionary for API response."""
@@ -656,6 +702,12 @@ class JiraIssue(ApiModel, TimestampMixin):
                 changelog.to_simplified_dict() for changelog in self.changelogs
             ]
 
+        # Do not gate this on should_include_field: rendered fields are present
+        # only when the caller asked for them via expand=renderedFields, which
+        # is a separate request from naming a field in `fields`.
+        if self.rendered_fields:
+            result["rendered_fields"] = self.rendered_fields
+
         # Add issue links if available and requested
         if self.issuelinks and should_include_field("issuelinks"):
             result["issuelinks"] = [
@@ -663,64 +715,119 @@ class JiraIssue(ApiModel, TimestampMixin):
             ]
 
         # Process custom fields
-        if self.custom_fields:
-            if self.requested_fields == "*all":
-                for internal_id, field_data_obj in self.custom_fields.items():
-                    processed_value = self._process_custom_field_value(
-                        field_data_obj.get("value")
-                    )
-                    output_value_obj = {"value": processed_value}
-                    if "name" in field_data_obj:
-                        output_value_obj["name"] = field_data_obj["name"]
-                    result[internal_id] = output_value_obj
-            elif isinstance(self.requested_fields, list):
-                for requested_key_or_name in self.requested_fields:
-                    found_by_id_or_name = False
-                    if (
-                        requested_key_or_name.startswith("customfield_")
-                        and requested_key_or_name in self.custom_fields
-                    ):
-                        field_data_obj = self.custom_fields[requested_key_or_name]
-                        output_value_obj = {
-                            "value": self._process_custom_field_value(
-                                field_data_obj.get("value")
-                            )
-                        }
-                        if "name" in field_data_obj:
-                            output_value_obj["name"] = field_data_obj["name"]
-                        result[requested_key_or_name] = output_value_obj
-                        found_by_id_or_name = True
-                    else:
-                        for internal_id, field_data_obj in self.custom_fields.items():
-                            if (
-                                field_data_obj.get("name", "").lower()
-                                == requested_key_or_name.lower()
-                            ):
-                                output_value_obj = {
-                                    "value": self._process_custom_field_value(
-                                        field_data_obj.get("value")
-                                    )
-                                }
-                                output_value_obj["name"] = field_data_obj["name"]
-                                result[internal_id] = output_value_obj
-                                found_by_id_or_name = True
-                                break
-                    if not found_by_id_or_name and requested_key_or_name.startswith(
-                        "cf_"
-                    ):
-                        full_id = "customfield_" + requested_key_or_name[3:]
-                        if full_id in self.custom_fields:
-                            field_data_obj = self.custom_fields[full_id]
-                            output_value_obj = {
-                                "value": self._process_custom_field_value(
-                                    field_data_obj.get("value")
-                                )
-                            }
-                            if "name" in field_data_obj:
-                                output_value_obj["name"] = field_data_obj["name"]
-                            result[full_id] = output_value_obj
+        result.update(self._collect_custom_fields_for_output())
 
         return {k: v for k, v in result.items() if v is not None}
+
+    @staticmethod
+    def _is_empty_custom_field_value(value: Any) -> bool:
+        """Report whether Jira reports this custom field as having no value.
+
+        Only ``None`` counts as empty, which is what "absent" means everywhere
+        else here: :meth:`to_simplified_dict` ends by dropping ``None`` entries
+        and :meth:`_process_custom_field_value` passes ``None`` straight
+        through. A blank string or an empty container is a value somebody
+        actually set - a cleared text field, a deliberately emptied
+        multi-select - and ``0``, ``False`` and other falsy scalars are
+        meaningful field values, so none of those are treated as empty.
+
+        Args:
+            value: A value already passed through
+                :meth:`_process_custom_field_value`.
+
+        Returns:
+            True when the value is ``None``, otherwise False.
+        """
+        return value is None
+
+    def _build_custom_field_output(self, field_data: dict[str, Any]) -> dict[str, Any]:
+        """Build the output object for one stored custom field.
+
+        Args:
+            field_data: A ``{"value": …}`` entry from ``custom_fields``,
+                optionally carrying a human-readable ``"name"``.
+
+        Returns:
+            An output object with the processed value plus the field name when
+            one is known.
+        """
+        output: dict[str, Any] = {
+            "value": self._process_custom_field_value(field_data.get("value"))
+        }
+        if "name" in field_data:
+            output["name"] = field_data["name"]
+        return output
+
+    def _collect_custom_fields_for_output(self) -> dict[str, Any]:
+        """Build the custom-field section of :meth:`to_simplified_dict`.
+
+        When every field was requested (``"*all"``), custom fields Jira reports
+        as ``null`` are omitted: an all-fields response is otherwise dominated
+        by fields the issue never had a value for. Nothing else is dropped - a
+        blank string or an empty list is a value somebody set. A field named
+        explicitly in ``requested_fields`` is always emitted, even when
+        ``null``, so callers can tell "this field is empty" apart from "this
+        field is not on the issue".
+
+        ``custom_fields`` itself is never filtered or mutated here - attribute
+        access (``issue.customfield_10011``), ``custom_fields_by_display_name``
+        and ``_find_custom_field_in_issue`` all rely on it staying complete.
+        Entries that are not ``{"value": …}`` objects, such as the
+        ``attachment_results`` sentinel written by ``update_issue`` (whose key
+        carries no ``customfield_`` prefix), are passed through untouched
+        rather than emptiness-checked or filtered on their key name.
+
+        Returns:
+            A mapping of custom field id to its output object.
+        """
+        output: dict[str, Any] = {}
+        if not self.custom_fields:
+            return output
+
+        if self.requested_fields == "*all":
+            for field_id, field_data in self.custom_fields.items():
+                if not isinstance(field_data, dict) or "value" not in field_data:
+                    # Not a stored custom field: pass it through untouched.
+                    output[field_id] = field_data
+                    continue
+                value_obj = self._build_custom_field_output(field_data)
+                if self._is_empty_custom_field_value(value_obj["value"]):
+                    continue
+                output[field_id] = value_obj
+            return output
+
+        if not isinstance(self.requested_fields, list):
+            return output
+
+        for requested_key_or_name in self.requested_fields:
+            found_by_id_or_name = False
+            field_data = self.custom_fields.get(requested_key_or_name)
+            if requested_key_or_name.startswith("customfield_") and isinstance(
+                field_data, dict
+            ):
+                output[requested_key_or_name] = self._build_custom_field_output(
+                    field_data
+                )
+                found_by_id_or_name = True
+            else:
+                for field_id, candidate in self.custom_fields.items():
+                    if not isinstance(candidate, dict):
+                        continue
+                    stored_name = candidate.get("name")
+                    if (
+                        isinstance(stored_name, str)
+                        and stored_name.lower() == requested_key_or_name.lower()
+                    ):
+                        output[field_id] = self._build_custom_field_output(candidate)
+                        found_by_id_or_name = True
+                        break
+            if not found_by_id_or_name and requested_key_or_name.startswith("cf_"):
+                full_id = "customfield_" + requested_key_or_name[3:]
+                aliased_data = self.custom_fields.get(full_id)
+                if isinstance(aliased_data, dict):
+                    output[full_id] = self._build_custom_field_output(aliased_data)
+
+        return output
 
     def _process_custom_field_value(self, field_value: Any) -> Any:
         """
