@@ -1386,10 +1386,15 @@ class TestQuoteBlocks:
     def test_quote_keeps_interior_blank_line_quoted(self, preprocessor):
         """An interior blank line keeps "> ", holding one blockquote together."""
         wiki = "{quote}\nfirst para\n\nsecond para\n{quote}"
-        assert preprocessor.jira_to_markdown(wiki) == "> first para\n> \n> second para"
+        assert preprocessor.jira_to_markdown(wiki) == (
+            "> first para\n> \n> second para"
+        )
 
 
-# Issue #1052 - {panel} blocks drop links during wiki-to-markdown conversion
+# Issue #1052 - {panel} blocks drop links during wiki-to-markdown conversion,
+# and its residual: Jira Cloud spells a panel's kind as bgColor and never emits
+# title=, so every colour panel read back as a bare paragraph with the whole
+# semantic (info vs warning vs error) gone.
 
 
 class TestPanelBlocks:
@@ -1400,68 +1405,135 @@ class TestPanelBlocks:
         return JiraPreprocessor(base_url="https://example.atlassian.net")
 
     @pytest.mark.parametrize(
-        "test_id, input_text, expected_present, expected_absent",
+        "wiki, expected",
         [
             pytest.param(
-                "panel-bare-url",
-                "{panel:title=Spec}[https://example.com]{panel}",
-                ["**Spec**", "https://example.com"],
-                ["{panel"],
-                id="panel-bare-url",
+                "{panel:bgColor=#deebff}\ninfo body\n{panel}",
+                ":::info\ninfo body\n:::",
+                id="bgcolor-info",
             ),
             pytest.param(
-                "panel-named-link",
-                "{panel:title=Spec}[Link Text|https://example.com]{panel}",
-                ["**Spec**", "[Link Text](https://example.com)"],
-                ["{panel"],
-                id="panel-named-link",
+                "{panel:bgColor=#eae6ff}\nnote body\n{panel}",
+                ":::note\nnote body\n:::",
+                id="bgcolor-note",
             ),
             pytest.param(
-                "panel-no-title",
-                "{panel}some content{panel}",
-                ["some content"],
-                ["{panel"],
-                id="panel-no-title",
+                "{panel:bgColor=#fffae6}\nwarning body\n{panel}",
+                ":::warning\nwarning body\n:::",
+                id="bgcolor-warning",
             ),
             pytest.param(
-                "panel-extra-params",
-                "{panel:borderColor=#ccc|title=Info}text{panel}",
-                ["**Info**", "text"],
-                ["{panel"],
-                id="panel-extra-params",
+                "{panel:bgColor=#e3fcef}\nsuccess body\n{panel}",
+                ":::success\nsuccess body\n:::",
+                id="bgcolor-success",
             ),
             pytest.param(
-                "panel-multiline",
+                "{panel:bgColor=#ffebe6}\nerror body\n{panel}",
+                ":::error\nerror body\n:::",
+                id="bgcolor-error",
+            ),
+            pytest.param(
+                # Not an info colour: info is also the fallback, so an
+                # upper-case #DEEBFF would pass even unrecognised.
+                "{panel:bgColor=#FFFAE6}\nbody\n{panel}",
+                ":::warning\nbody\n:::",
+                id="bgcolor-is-case-insensitive",
+            ),
+            pytest.param(
+                "{panel:borderStyle=dashed|bgColor=#fffae6}\nbody\n{panel}",
+                ":::warning\nbody\n:::",
+                id="bgcolor-beside-other-params",
+            ),
+            pytest.param(
+                "{panel:bgColor=#123456}\nbody\n{panel}",
+                ":::info\nbody\n:::",
+                id="unrecognised-colour-falls-back-to-info",
+            ),
+            pytest.param(
+                "{panel}\nbody\n{panel}",
+                ":::info\nbody\n:::",
+                id="no-params-falls-back-to-info",
+            ),
+            pytest.param(
+                "{panel:borderColor=#fffae6}\nbody\n{panel}",
+                ":::info\nbody\n:::",
+                id="another-colour-param-is-not-the-background",
+            ),
+            pytest.param(
+                # Not a parameter Jira emits: it pins the guard, which is that
+                # a name merely *ending* in a known one is a different
+                # parameter.  The colour keeps the case honest -- info is also
+                # the fallback.
+                "{panel:bgColor=#fffae6|subtitle=Nope}\nbody\n{panel}",
+                ":::warning\nbody\n:::",
+                id="a-param-name-ending-in-title-is-not-the-title",
+            ),
+            pytest.param(
                 "{panel:title=Notes}line one\nline two{panel}",
-                ["line one", "line two"],
-                ["{panel"],
-                id="panel-multiline",
+                ":::info\n**Notes**\n\nline one\nline two\n:::",
+                id="title-becomes-bold-first-paragraph-inside",
             ),
             pytest.param(
-                "multiple-panels",
+                "{panel:bgColor=#fffae6|title=Careful}\nbody\n{panel}",
+                ":::warning\n**Careful**\n\nbody\n:::",
+                id="colour-and-title",
+            ),
+            pytest.param(
+                "{panel:bgColor=#deebff}\n*Titled*\n\nafter title\n{panel}",
+                ":::info\n**Titled**\n\nafter title\n:::",
+                id="cloud-sends-a-title-as-bold-content",
+            ),
+            pytest.param(
+                "{panel:bgColor=#eae6ff}\n* item\n{panel}",
+                ":::note\n- item\n:::",
+                id="bullet-list-inside",
+            ),
+            pytest.param(
+                "{panel:bgColor=#deebff}\nh3. H3 inside\n\nbody\n{panel}",
+                ":::info\n### H3 inside\n\nbody\n:::",
+                id="heading-inside",
+            ),
+            pytest.param(
+                "{panel:bgColor=#deebff}\nouter\n\n{code:python}y = 2{code}\n{panel}",
+                ":::info\nouter\n\n```python\ny = 2\n```\n:::",
+                id="code-block-inside",
+            ),
+            pytest.param(
                 "{panel:title=A}content A{panel}\n{panel:title=B}content B{panel}",
-                ["**A**", "content A", "**B**", "content B"],
-                ["{panel"],
-                id="multiple-panels",
+                ":::info\n**A**\n\ncontent A\n:::\n\n:::info\n**B**\n\ncontent B\n:::",
+                id="two-panels-stay-separate",
             ),
         ],
     )
-    def test_panel_conversion(
-        self,
-        preprocessor,
-        test_id: str,
-        input_text: str,
-        expected_present: list[str],
-        expected_absent: list[str],
-    ):
-        """Test {panel} block conversion to markdown."""
-        result = preprocessor.jira_to_markdown(input_text)
-        for expected in expected_present:
-            assert expected in result, f"[{test_id}] Expected '{expected}' in: {result}"
-        for absent in expected_absent:
-            assert absent not in result, (
-                f"[{test_id}] Unexpected '{absent}' in: {result}"
-            )
+    def test_panel_conversion(self, preprocessor, wiki: str, expected: str):
+        """A panel converts to the ::: fence markdown_to_adf reads back.
+
+        The wiki strings carrying a bgColor are what Jira Cloud returned from
+        /rest/api/2 for an ADF panel of that panelType.
+        """
+        assert preprocessor.jira_to_markdown(wiki).strip() == expected
+
+    @pytest.mark.parametrize(
+        "wiki, expected_link",
+        [
+            pytest.param(
+                "{panel:title=Spec}[https://example.com]{panel}",
+                "https://example.com",
+                id="panel-bare-url",
+            ),
+            pytest.param(
+                "{panel:title=Spec}[Link Text|https://example.com]{panel}",
+                "[Link Text](https://example.com)",
+                id="panel-named-link",
+            ),
+        ],
+    )
+    def test_panel_keeps_links(self, preprocessor, wiki: str, expected_link: str):
+        """A link inside a panel survives the conversion (the reported bug)."""
+        result = preprocessor.jira_to_markdown(wiki)
+        assert expected_link in result, f"Link dropped: {result}"
+        assert "**Spec**" in result
+        assert "{panel" not in result
 
     def test_panel_full_pipeline(self, preprocessor):
         """Test panel with URL link through the full clean_jira_text pipeline (the reported bug)."""
@@ -1473,6 +1545,110 @@ class TestPanelBlocks:
         """Test bare [url] link is preserved outside panels too."""
         result = preprocessor.jira_to_markdown("[https://example.com] more text")
         assert "https://example.com" in result, f"URL dropped: {result}"
+
+
+# Issue #1503 - {info}/{note}/{warning}/{tip}/{expand} were not converted at
+# all and leaked through as literal wiki text.
+
+
+class TestBlockMacros:
+    """Tests for the block macros that open and close with the same bare tag."""
+
+    @pytest.fixture
+    def preprocessor(self):
+        return JiraPreprocessor(base_url="https://example.atlassian.net")
+
+    @pytest.mark.parametrize(
+        "wiki, expected",
+        [
+            pytest.param("{info}body{info}", ":::info\nbody\n:::", id="info"),
+            pytest.param("{note}body{note}", ":::note\nbody\n:::", id="note"),
+            pytest.param(
+                "{warning}body{warning}",
+                ":::warning\nbody\n:::",
+                id="warning",
+            ),
+            pytest.param(
+                "{tip}body{tip}",
+                ":::success\nbody\n:::",
+                id="tip-maps-to-success",
+            ),
+            pytest.param(
+                "{info:title=Heads up}body{info}",
+                ":::info\n**Heads up**\n\nbody\n:::",
+                id="info-title-becomes-bold-first-paragraph",
+            ),
+            pytest.param(
+                "{expand:Details}body{expand}",
+                ":::expand Details\nbody\n:::",
+                id="expand-bare-title",
+            ),
+            pytest.param(
+                "{expand:title=Details}body{expand}",
+                ":::expand Details\nbody\n:::",
+                id="expand-title-param",
+            ),
+            pytest.param(
+                "{expand}body{expand}",
+                ":::expand\nbody\n:::",
+                id="expand-without-a-title",
+            ),
+            pytest.param(
+                "{note}\nbody\n{note}",
+                ":::note\nbody\n:::",
+                id="tag-already-on-its-own-line",
+            ),
+            pytest.param(
+                "{warning}\nfirst para\n\nsecond para\n{warning}",
+                ":::warning\nfirst para\n\nsecond para\n:::",
+                id="two-paragraphs-inside",
+            ),
+        ],
+    )
+    def test_macro_conversion(self, preprocessor, wiki: str, expected: str):
+        """Each macro converts to its ::: fence, never to literal wiki text."""
+        assert preprocessor.jira_to_markdown(wiki).strip() == expected
+
+    def test_macro_keeps_surrounding_prose_separate(self, preprocessor):
+        """The fence owns its line without absorbing the prose around it."""
+        wiki = "prose before\n\n{note}\nnote body\n{note}\n\nprose after"
+        assert preprocessor.jira_to_markdown(wiki) == (
+            "prose before\n\n:::note\nnote body\n:::\n\nprose after"
+        )
+
+    def test_nested_same_tag_macros_pair_by_parameters(self, preprocessor):
+        """A tag with parameters always opens; only a bare tag can close.
+
+        A lazy per-tag regex pairs {expand:A} with the first *bare* {expand},
+        swallowing {expand:B} into the content and leaving the last token as
+        literal text.
+        """
+        wiki = "{expand:A}outer{expand:B}inner{expand}{expand}"
+        assert preprocessor.jira_to_markdown(wiki).strip() == (
+            ":::expand A\nouter\n:::expand B\ninner\n:::\n\n:::"
+        )
+
+    def test_repeated_bare_tag_toggles(self, preprocessor):
+        """Jira's renderer treats a repeated bare tag as open, close, open."""
+        assert preprocessor.jira_to_markdown("{info}a{info}b{info}c{info}").strip() == (
+            ":::info\na\n:::\nb\n:::info\nc\n:::"
+        )
+
+    @pytest.mark.parametrize(
+        "wiki",
+        [
+            pytest.param("a lone {info} in prose", id="lone-tag-in-prose"),
+            pytest.param("{note}opened and never closed", id="opener-never-closed"),
+        ],
+    )
+    def test_unpaired_macro_stays_literal(self, preprocessor, wiki: str):
+        """An unpaired tag must not open a fence that never closes."""
+        assert preprocessor.jira_to_markdown(wiki) == wiki
+
+    def test_interleaved_macros_do_not_borrow_each_others_closers(self, preprocessor):
+        """A closer belongs to its own tag; the abandoned opener stays literal."""
+        result = preprocessor.jira_to_markdown("{info}a{note}b{info}").strip()
+        assert result == ":::info\na{note}b\n:::"
 
 
 # Code block placeholder protection tests

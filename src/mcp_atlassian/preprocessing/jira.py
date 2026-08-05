@@ -328,6 +328,44 @@ def _wrap_bold_or_italic(match: re.Match[str]) -> str:
 # the flag to change.
 _QUOTE_BLOCK_PATTERN = re.compile(r"\{quote\}([\s\S]*?)\{quote\}")
 
+# Jira Cloud spells a panel's kind as a background colour and never emits
+# ``title=``; these five colours are the whole vocabulary its editor produces.
+# Mapping them back is what keeps a warning panel from reading as an ordinary
+# paragraph -- the panel's entire meaning lives in this one hex value.  The
+# fence spellings are the ones ``markdown_to_adf`` reads back as a real ADF
+# ``panel``, so a colour panel survives a read/write cycle.
+_PANEL_BG_COLOR_TYPES = {
+    "#deebff": "info",
+    "#eae6ff": "note",
+    "#fffae6": "warning",
+    "#e3fcef": "success",
+    "#ffebe6": "error",
+}
+# Matched on the parameter's value, not on the whole parameter string: Jira puts
+# ``borderStyle`` or ``title`` alongside the colour, in either order.  Anchoring
+# on ``|`` (or the start) keeps a ``borderColor`` from being read as ``bgColor``
+# and a ``subtitle`` from being read as ``title``.
+_PANEL_BG_COLOR_PATTERN = re.compile(
+    r"(?:^|\|)\s*bgColor\s*=\s*([^|}]+)", re.IGNORECASE
+)
+_MACRO_TITLE_PATTERN = re.compile(r"(?:^|\|)\s*title\s*=\s*([^|}]+)", re.IGNORECASE)
+
+# The block macros a Server/DC author writes by hand, and the panel type each
+# one carries.  ``{tip}`` has no counterpart in ADF, where the closest panel
+# type is ``success``; the read side therefore never emits ``:::tip``.
+_MACRO_PANEL_TYPES = {
+    "info": "info",
+    "note": "note",
+    "warning": "warning",
+    "tip": "success",
+}
+# ``{panel}`` and ``{expand}`` are handled separately: a panel takes its type
+# from ``bgColor``, an expand takes a title into the fence itself.
+_BLOCK_MACRO_TAGS = ("panel", "expand", *_MACRO_PANEL_TYPES)
+_BLOCK_MACRO_PATTERN = re.compile(
+    r"\{(" + "|".join(_BLOCK_MACRO_TAGS) + r")(?::([^}\n]*))?\}", re.IGNORECASE
+)
+
 
 def _convert_quote_block(match: re.Match[str]) -> str:
     """Convert one ``{quote}`` block to ``> ``-prefixed markdown lines.
@@ -349,17 +387,178 @@ def _convert_quote_block(match: re.Match[str]) -> str:
     return "\n".join(f"> {line}" for line in content.split("\n"))
 
 
-def _convert_panel(params: str | None, content: str) -> str:
-    """Convert a Jira {panel} block to markdown."""
-    title = ""
+def _panel_type_from_params(params: str | None) -> str:
+    """Map a wiki panel's ``bgColor`` to the markdown fence's panel type.
+
+    Args:
+        params: Parameter string of a ``{panel:...}`` tag, or None for a bare
+            ``{panel}``.
+
+    Returns:
+        One of the five fence panel types; ``"info"`` when the panel carries no
+        colour, an unrecognised one, or only a title.
+    """
     if params:
-        title_match = re.search(r"title=([^|}]+)", params)
-        if title_match:
-            title = title_match.group(1).strip()
-    content = content.strip()
+        match = _PANEL_BG_COLOR_PATTERN.search(params)
+        if match:
+            panel_type = _PANEL_BG_COLOR_TYPES.get(match.group(1).strip().lower())
+            if panel_type:
+                return panel_type
+    return "info"
+
+
+def _macro_title(params: str | None) -> str:
+    """Read the ``title=`` parameter of a block macro.
+
+    Args:
+        params: Parameter string of the macro's opening tag, or None.
+
+    Returns:
+        The title, stripped, or ``""`` when the macro carries none.
+    """
+    if not params:
+        return ""
+    match = _MACRO_TITLE_PATTERN.search(params)
+    return match.group(1).strip() if match else ""
+
+
+def _expand_title(params: str | None) -> str:
+    """Read the title of an ``{expand}`` macro, in either spelling.
+
+    ``{expand:Details}`` is the common hand-written form and ``{expand:title=Details}``
+    the explicit one; a parameter string that assigns something else carries no
+    title.
+
+    Args:
+        params: Parameter string of the ``{expand}`` tag, or None.
+
+    Returns:
+        The title, stripped, or ``""`` when the macro carries none.
+    """
+    if not params:
+        return ""
+    title = _macro_title(params)
     if title:
-        return f"\n**{title}**\n{content}\n"
-    return f"\n{content}\n"
+        return title
+    return "" if "=" in params else params.strip()
+
+
+def _macro_open_fence(tag: str, params: str | None) -> str:
+    """Build the opening ``:::`` fence for one block macro.
+
+    Args:
+        tag: Lower-cased macro tag, e.g. ``"panel"`` or ``"warning"``.
+        params: Parameter string of the opening tag, or None.
+
+    Returns:
+        The fence line, followed by the title as a bold line when the macro has
+        one.  ADF has no title on a panel, so a wiki title has to become
+        content: a bold first paragraph inside the fence is what round-trips.
+    """
+    if tag == "expand":
+        title = _expand_title(params)
+        return f":::expand {title}" if title else ":::expand"
+    panel_type = _MACRO_PANEL_TYPES.get(tag) or _panel_type_from_params(params)
+    title = _macro_title(params)
+    if title:
+        return f":::{panel_type}\n**{title}**\n"
+    return f":::{panel_type}"
+
+
+def _pop_innermost_open(
+    matches: list[re.Match[str]], open_stack: list[int], tag: str
+) -> int | None:
+    """Take the innermost still-open macro with ``tag`` off ``open_stack``.
+
+    Any macro opened after it is abandoned, so interleaved tags such as
+    ``{info}a{note}b{info}`` close the info and leave the ``{note}`` token
+    literal instead of emitting a fence closed by another macro's tag.
+
+    Args:
+        matches: Every macro token in the text, in order.
+        open_stack: Indices into ``matches`` of the macros still open,
+            outermost first; mutated in place.
+        tag: Lower-cased tag of the closing token.
+
+    Returns:
+        Index of the matching opener, or None when no macro of that tag is
+        open.
+    """
+    for depth in range(len(open_stack) - 1, -1, -1):
+        if matches[open_stack[depth]].group(1).lower() == tag:
+            opener = open_stack[depth]
+            del open_stack[depth:]
+            return opener
+    return None
+
+
+def _convert_block_macros(text: str) -> str:
+    """Convert Jira's block macros to the ``:::`` fenced markdown form.
+
+    Every macro handled here -- ``{panel}``, ``{info}``, ``{note}``,
+    ``{warning}``, ``{tip}`` and ``{expand}`` -- closes with the *same* bare tag
+    it opens with, so nothing in a single token says whether it opens or closes.
+    A lazy per-tag regex gets that wrong as soon as two macros of one kind nest:
+    in ``{expand:A}outer {expand:B}inner{expand}{expand}`` it pairs
+    ``{expand:A}`` with the first *bare* ``{expand}``, swallowing ``{expand:B}``
+    into the content and leaving the trailing token as literal text.  The tokens
+    are therefore paired by a scan over two rules:
+
+    * a token that carries parameters is always an opener -- ``{expand:B}``
+      cannot close anything;
+    * a bare token closes the innermost open macro of the same tag, and opens
+      one when no macro of that tag is open, which is how Jira's own renderer
+      treats a repeated bare tag.
+
+    A token left unpaired converts to nothing and is emitted verbatim, so a
+    lone ``{info}`` in prose stays prose rather than opening a fence that never
+    closes.
+
+    Args:
+        text: Text in Jira wiki markup, with code blocks already extracted.
+
+    Returns:
+        Text with every paired macro replaced by a ``:::`` fence on its own
+        line.
+    """
+    matches = list(_BLOCK_MACRO_PATTERN.finditer(text))
+    if not matches:
+        return text
+
+    fences: dict[int, str] = {}
+    open_stack: list[int] = []
+    for index, match in enumerate(matches):
+        tag = match.group(1).lower()
+        if match.group(2) is None:
+            opener = _pop_innermost_open(matches, open_stack, tag)
+            if opener is not None:
+                fences[opener] = _macro_open_fence(tag, matches[opener].group(2))
+                fences[index] = ":::"
+                continue
+        open_stack.append(index)
+
+    # A fence has to own its line, and one newline is dropped on each side of it
+    # so that a macro Jira already put on its own line does not gain a blank
+    # one, while an inline ``{info}body{info}`` still lands on three lines.
+    parts: list[str] = []
+    position = 0
+    after_fence = False
+    for index, match in enumerate(matches):
+        segment = text[position : match.start()]
+        position = match.end()
+        if after_fence:
+            segment = segment.removeprefix("\n")
+        fence = fences.get(index)
+        if fence is None:
+            parts.append(segment + match.group(0))
+            after_fence = False
+            continue
+        parts.append(segment.removesuffix("\n"))
+        parts.append(f"\n{fence}\n")
+        after_fence = True
+    tail = text[position:]
+    parts.append(tail.removeprefix("\n") if after_fence else tail)
+    return "".join(parts)
 
 
 class JiraPreprocessor(BasePreprocessor):
@@ -646,13 +845,9 @@ class JiraPreprocessor(BasePreprocessor):
         # Quote blocks, one block at a time.  See _QUOTE_BLOCK_PATTERN.
         output = _QUOTE_BLOCK_PATTERN.sub(_convert_quote_block, output)
 
-        # Panel blocks - extract content, optionally show title as bold
-        output = re.sub(
-            r"\{panel(?::([^}]*))?\}([\s\S]*?)\{panel\}",
-            lambda match: _convert_panel(match.group(1), match.group(2)),
-            output,
-            flags=re.MULTILINE,
-        )
+        # Panels and the {info}/{note}/{warning}/{tip}/{expand} macros, as :::
+        # fences -- the spelling markdown_to_adf reads back as a real ADF panel.
+        output = _convert_block_macros(output)
 
         # Images with alt text
         output = re.sub(

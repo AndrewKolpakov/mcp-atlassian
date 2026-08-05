@@ -218,6 +218,37 @@ See [PROJ-123|https://example.atlassian.net/browse/PROJ-123|smart-link] for deta
         assert "`inline code`" in cleaned
         assert "def hello():" in cleaned
 
+    @pytest.mark.parametrize(
+        "jira_markup, expected",
+        [
+            pytest.param(
+                "{panel:bgColor=#fffae6}\ncareful, [Docs|https://example.com]\n{panel}",
+                ":::warning\ncareful, [Docs](https://example.com)\n:::",
+                id="colour-panel",
+            ),
+            pytest.param(
+                "{panel:bgColor=#e3fcef}\n* one\n* two\n{panel}",
+                ":::success\n- one\n- two\n:::",
+                id="panel-holding-a-list",
+            ),
+            pytest.param(
+                "{note}\nplain note\n{note}",
+                ":::note\nplain note\n:::",
+                id="note-macro",
+            ),
+        ],
+    )
+    def test_jira_block_markup_survives_the_full_pipeline(
+        self, jira_preprocessor, jira_markup: str, expected: str
+    ):
+        """Panels and macros survive the HTML pass clean_jira_text runs.
+
+        jira_to_markdown emits ``:::`` fences, and _convert_html_to_markdown
+        then runs over the whole field; the fence may not be rewritten on the
+        way through.
+        """
+        assert jira_preprocessor.clean_jira_text(jira_markup) == expected
+
     def test_jira_nested_lists_preservation(self, jira_preprocessor):
         """Test preservation of nested list structures."""
         jira_markup = """* Level 1 item
