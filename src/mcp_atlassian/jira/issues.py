@@ -78,6 +78,51 @@ class IssuesMixin(
             )
             return description_adf
 
+    def _fetch_issue(
+        self,
+        issue_key: str,
+        *,
+        expand: str | None = None,
+        fields: str | None = None,
+        properties: str | None = None,
+        update_history: bool = True,
+    ) -> Any:
+        """Fetch one issue's raw JSON, from v3 on Cloud and v2 on Server/DC.
+
+        The parameters are the ones ``atlassian-python-api``'s ``get_issue``
+        sends, spelled the same way, so the only difference between the two
+        branches is the API version -- and therefore whether rich-text fields
+        come back as ADF or as wiki markup.
+
+        Args:
+            issue_key: The issue key or id.
+            expand: Value for the ``expand`` query parameter, or None.
+            fields: Comma-separated field list, or None for the API default.
+            properties: Comma-separated property list, or None.
+            update_history: Whether the read counts as a view.
+
+        Returns:
+            The parsed JSON body, as the underlying client returns it.
+        """
+        if not self.config.is_cloud:
+            return self.jira.get_issue(
+                issue_key,
+                expand=expand,
+                fields=fields,
+                properties=properties,
+                update_history=update_history,
+            )
+
+        params: dict[str, Any] = {}
+        if fields is not None:
+            params["fields"] = fields
+        if properties is not None:
+            params["properties"] = properties
+        if expand:
+            params["expand"] = expand
+        params["updateHistory"] = str(update_history).lower()
+        return self._get_api3(f"issue/{issue_key}", params=params)
+
     def get_issue(
         self,
         issue_key: str,
@@ -197,8 +242,11 @@ class IssuesMixin(
             elif isinstance(properties, list | tuple | set):
                 properties_param = ",".join(properties)
 
-            # Get the issue data with all parameters
-            issue = self.jira.get_issue(
+            # Get the issue data with all parameters. Cloud is read through v3
+            # so that description, environment and text-area custom fields
+            # arrive as ADF -- what is actually stored -- instead of v2's wiki
+            # markup rendering of it. Server/DC has no v3 API.
+            issue = self._fetch_issue(
                 issue_key,
                 expand=expand_param,
                 fields=fields_param,
@@ -221,14 +269,20 @@ class IssuesMixin(
             # Extract fields data, safely handling None
             fields_data = issue.get("fields", {}) or {}
 
-            # Clean description field (convert Jira wiki markup to Markdown)
-            # Note: ADF format (dict) is handled in the model layer
-            if "description" in fields_data:
-                raw_description = fields_data["description"]
-                # Only clean string descriptions (wiki markup)
-                # Dict descriptions (ADF) are handled by the model
-                if isinstance(raw_description, str) and raw_description:
-                    fields_data["description"] = self._clean_text(raw_description)
+            # Clean the wiki markup text fields (Server/DC, and any v2 payload):
+            # convert them to Markdown. An ADF dict is handled in the model
+            # layer instead, and must NOT be cleaned -- the wiki preprocessor
+            # would read the Markdown it produces as wiki markup and convert it
+            # a second time.
+            #
+            # environment is cleaned alongside description because it is the
+            # same kind of field; without this a Server/DC environment reached
+            # the caller as raw wiki markup while its description did not.
+            for text_field in ("description", "environment"):
+                if text_field in fields_data:
+                    raw_value = fields_data[text_field]
+                    if isinstance(raw_value, str) and raw_value:
+                        fields_data[text_field] = self._clean_text(raw_value)
 
             # Get comments if needed
             if "comment" in fields_data:
@@ -372,9 +426,9 @@ class IssuesMixin(
         """
         if comment_limit is None or comment_limit > 0:
             try:
-                response = self.jira.issue_get_comments(issue_key)
+                response = self._fetch_issue_comments(issue_key)
                 if not isinstance(response, dict):
-                    msg = f"Unexpected return value type from `jira.issue_get_comments`: {type(response)}"
+                    msg = f"Unexpected return value type from `_fetch_issue_comments`: {type(response)}"
                     logger.error(msg)
                     raise TypeError(msg)
 
@@ -773,9 +827,9 @@ class IssuesMixin(
                         )
 
             # Get the full issue data and convert to JiraIssue model
-            issue_data = self.jira.get_issue(issue_key)
+            issue_data = self._fetch_issue(issue_key)
             if not isinstance(issue_data, dict):
-                msg = f"Unexpected return value type from `jira.get_issue`: {type(issue_data)}"
+                msg = f"Unexpected return value type from `_fetch_issue`: {type(issue_data)}"
                 logger.error(msg)
                 raise TypeError(msg)
             return JiraIssue.from_api_response(issue_data)
@@ -1302,7 +1356,7 @@ class IssuesMixin(
                     # Continue with the update even if attachments fail
 
             # Get the updated issue data and convert to JiraIssue model
-            issue_data = self.jira.get_issue(issue_key, fields=return_fields_param)
+            issue_data = self._fetch_issue(issue_key, fields=return_fields_param)
             if isinstance(issue_data, str):
                 # atlassian-python-api can return a string on Jira Server/DC
                 # when response.json() fails. Try parsing it as JSON first.
@@ -1318,7 +1372,7 @@ class IssuesMixin(
                     )
             if not isinstance(issue_data, dict):
                 msg = (
-                    f"Unexpected return value type from `jira.get_issue`: "
+                    f"Unexpected return value type from `_fetch_issue`: "
                     f"{type(issue_data)}"
                 )
                 logger.error(msg)
@@ -1436,9 +1490,9 @@ class IssuesMixin(
 
         # If no status change is requested, return the issue
         if not status:
-            issue_data = self.jira.get_issue(issue_key, fields=return_fields_param)
+            issue_data = self._fetch_issue(issue_key, fields=return_fields_param)
             if not isinstance(issue_data, dict):
-                msg = f"Unexpected return value type from `jira.get_issue`: {type(issue_data)}"
+                msg = f"Unexpected return value type from `_fetch_issue`: {type(issue_data)}"
                 logger.error(msg)
                 raise TypeError(msg)
             return JiraIssue.from_api_response(
@@ -1537,9 +1591,11 @@ class IssuesMixin(
         )
 
         # Get the updated issue data
-        issue_data = self.jira.get_issue(issue_key, fields=return_fields_param)
+        issue_data = self._fetch_issue(issue_key, fields=return_fields_param)
         if not isinstance(issue_data, dict):
-            msg = f"Unexpected return value type from `jira.get_issue`: {type(issue_data)}"
+            msg = (
+                f"Unexpected return value type from `_fetch_issue`: {type(issue_data)}"
+            )
             logger.error(msg)
             raise TypeError(msg)
         return JiraIssue.from_api_response(
@@ -1689,9 +1745,9 @@ class IssuesMixin(
             if isinstance(processed_issues, list) and processed_issues:
                 lookup_key = str(processed_issues[0])
 
-            issue_data = self.jira.get_issue(lookup_key)
+            issue_data = self._fetch_issue(lookup_key)
             if not isinstance(issue_data, dict):
-                msg = f"Unexpected return value type from `jira.get_issue`: {type(issue_data)}"
+                msg = f"Unexpected return value type from `_fetch_issue`: {type(issue_data)}"
                 logger.error(msg)
                 raise TypeError(msg)
             return JiraIssue.from_api_response(issue_data)
@@ -1977,9 +2033,9 @@ class IssuesMixin(
                 if issue_key:
                     try:
                         # Fetch the full issue data
-                        issue_data = self.jira.get_issue(issue_key)
+                        issue_data = self._fetch_issue(issue_key)
                         if not isinstance(issue_data, dict):
-                            msg = f"Unexpected return value type from `jira.get_issue`: {type(issue_data)}"
+                            msg = f"Unexpected return value type from `_fetch_issue`: {type(issue_data)}"
                             logger.error(msg)
                             raise TypeError(msg)
 

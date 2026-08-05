@@ -130,24 +130,32 @@ MCP Atlassian supports both Atlassian Cloud and Server/Data Center deployments, 
 
 | Feature | Cloud | Server/DC |
 |---------|-------|-----------|
-| Issue descriptions | ADF (Atlassian Document Format) | Wiki markup |
+| Issue descriptions (stored) | ADF (Atlassian Document Format) | Wiki markup |
 | Confluence pages | Storage format (XHTML) | Storage format (XHTML) |
-| Markdown input | Auto-converted to ADF | Auto-converted to wiki markup |
-| Rich text rendering | ADF JSON | Wiki markup |
+| Markdown you write | Converted to ADF | Converted to wiki markup |
+| What a read returns to you | Markdown, converted from ADF | Markdown, converted from wiki markup |
 
 <Tip>
-MCP Atlassian handles format conversion automatically — you always write in Markdown regardless of platform. The tools convert to the appropriate format (ADF for Cloud, wiki markup for Server/DC).
+MCP Atlassian handles format conversion automatically — you always write **and read** Markdown regardless of platform. Writes convert to the appropriate stored format (ADF for Cloud, wiki markup for Server/DC), and reads convert back.
 </Tip>
+
+On Cloud both directions go through the same Markdown vocabulary — `:::info` / `:::note` / `:::warning` / `:::success` / `:::error` panels, `:::expand <title>`, `> ` quotes, fenced code, pipe tables, `- ` / `1. ` lists and `- [ ]` tasks — so reading an issue, editing the Markdown and writing it back preserves the structure instead of degrading it.
+
+A few ADF constructs have no Markdown spelling and are read as text: `underline`, coloured text, sub/superscript, and a `status` lozenge. Attachments and embedded images are read as a `(media: name)` marker; the write path re-attaches the real nodes rather than rebuilding them from text.
 
 ### API Differences
 
 | Aspect | Cloud | Server/DC |
 |--------|-------|-----------|
 | Base URL | `*.atlassian.net` | Custom domain |
-| API version | REST API v2 + v3 | REST API v2 |
+| API version | REST API v3 (reads and writes) | REST API v2 |
 | User identifiers | `accountId` | `username` or `userKey` |
 | Rate limiting | Enforced (~100 req/min) | Instance-dependent |
 | Webhooks | Cloud-managed | Self-managed |
+
+<Note>
+Cloud issue, comment and worklog reads go over `/rest/api/3`, which returns the stored ADF document. The v2 endpoints return Atlassian's own wiki markup *rendering* of that document, which loses information before it ever reaches this server — a panel's colour, for instance. Server/DC has no v3 API and is read over v2.
+</Note>
 
 <Warning>
 When switching between Cloud and Server/DC, custom field IDs will be different. Use `jira_search_fields` to discover the correct field IDs for your instance.

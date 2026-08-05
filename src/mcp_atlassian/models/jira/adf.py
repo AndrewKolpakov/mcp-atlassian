@@ -24,6 +24,32 @@ _PANEL_TYPE_ALIASES = {"tip": "success"}
 # opaque 400 INVALID_INPUT that names no field. See _flatten_panel_content.
 _PANEL_FORBIDDEN_CHILD_TYPES = frozenset({"blockquote", "panel"})
 _TABLE_SEPARATOR_RE = re.compile(r"^:?-+:?$")
+# A rendered line matching this would be read back as a block construct rather
+# than as the prose it is, so the read path escapes its first character. ``*``
+# and the backtick are absent on purpose: inline escaping has already handled
+# them by the time a line is assembled.
+_BLOCK_START_PATTERN = re.compile(
+    r"^(?:#{1,6}[ \t]|[-+][ \t]|>[ \t]|\||:::|\{expand|-{3,}[ \t]*$|_{3,}[ \t]*$)"
+)
+# An ordered-list start is escaped on its punctuation rather than its first
+# character; see _escape_block_start.
+_ORDERED_START_PATTERN = re.compile(r"^(?P<number>\d+)[.)][ \t]")
+# Whether a rendered block is itself a list, i.e. attaches directly under the
+# list item above it instead of being separated by a blank line.
+_LIST_ITEM_START_PATTERN = re.compile(r"^(?:[-*][ \t]|\d+\.[ \t])")
+# One list line: its indentation (which decides nesting), its marker and the
+# item text. Used by both directions, so they agree on what a list line is.
+_LIST_LINE_PATTERN = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<marker>[-*]|\d+\.)[ \t]+(?P<text>.*)$"
+)
+# A ``:::`` line that opens a block rather than closing one. Used to count
+# depth, so a panel nested in an expand does not close the expand.
+_NESTED_FENCE_OPEN_PATTERN = re.compile(r"^:::[A-Za-z]")
+# The opening run of a code fence, and whatever follows it as the language.
+_CODE_FENCE_PATTERN = re.compile(r"^(?P<fence>`{3,})(?P<language>.*)$")
+# Punctuation a backslash may escape on the way in. Mirrors CommonMark's
+# escapable set, so ``C:\path`` keeps its backslash while ``\*`` does not.
+_MD_ESCAPABLE_PUNCTUATION = r"\\`*_{}\[\]()#+\-.!|~>:"
 _JIRA_ISSUE_KEY_RE = re.compile(
     r"(?<![A-Za-z0-9_/-])"
     r"([A-Z][A-Z0-9_]+-\d+(?:-\d+)*)"
@@ -163,6 +189,36 @@ def _apply_marks(
     return nodes
 
 
+def _parse_marked_span(
+    inner: str,
+    marks: list[dict[str, Any]],
+    jira_base_url: str = "",
+    known_project_keys: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Parse the inside of an emphasis span and stack its marks on the result.
+
+    The body is parsed recursively rather than taken literally, exactly as link
+    text is, so an escape or a nested marker inside the span is understood:
+    ``**a\\*b**`` is bold text containing an asterisk, not bold text containing
+    a backslash. Issue-key auto-linking still applies, which taking the body
+    literally also used to do.
+
+    Args:
+        inner: Text between the markers.
+        marks: Marks to stack onto every text node the body produces.
+        jira_base_url: Jira base URL used to link bare issue keys.
+        known_project_keys: Normalized allowlist of project keys whose issue
+            keys may be linked; None links every issue-key-shaped token.
+
+    Returns:
+        Inline nodes carrying both their own marks and the span's.
+    """
+    return _apply_marks(
+        _parse_inline_formatting(inner, jira_base_url, known_project_keys),
+        marks,
+    )
+
+
 def _parse_inline_formatting(
     text: str,
     jira_base_url: str = "",
@@ -204,20 +260,28 @@ def _parse_inline_formatting(
         return []
 
     nodes: list[dict[str, Any]] = []
-    # Pattern order matters: mention before link, bold before italic,
-    # code before others.
+    # Pattern order matters: an escape before everything (a backslash has to
+    # win over the marker it protects), then mention before link, the triple
+    # marker before bold (``***x***`` is bold *and* italic, and reading it as
+    # bold-then-stray-asterisk would corrupt it), bold before italic, code
+    # before others.
     inline_re = re.compile(
-        r"\[~accountid:(?P<wiki_mention_id>[^\]]+)\]"
+        rf"\\(?P<escaped>[{_MD_ESCAPABLE_PUNCTUATION}])"
+        r"|\[~accountid:(?P<wiki_mention_id>[^\]]+)\]"
         r"|@\[(?P<display_mention_text>[^\]]+)\]"
         r"\(accountid:(?P<display_mention_id>[^)]+)\)"
         r"|`(?P<code_inner>[^`]+)`"
+        r"|\*\*\*(?P<bold_italic_inner>.+?)\*\*\*"
         r"|\*\*(?P<bold_inner>.+?)\*\*"
         r"|~~(?P<strike_inner>.+?)~~"
-        r"|\[(?P<link_text>[^\]]+)\]\((?P<link_href>[^)]+)\)"
+        # A label may hold an escaped bracket, so ``[a\]b](url)`` stays one
+        # link instead of falling out of the pattern and becoming literal text.
+        r"|\[(?P<link_text>(?:\\.|[^\]\\])+)\]\((?P<link_href>[^)]+)\)"
         r"|(?<!\*)\*(?!\*)(?P<italic_inner>.+?)(?<!\*)\*(?!\*)"
     )
 
     pos = 0
+    had_escape = False
     for m in inline_re.finditer(text):
         # Add any plain text before this match
         if m.start() > pos:
@@ -226,7 +290,13 @@ def _parse_inline_formatting(
                 nodes, plain, jira_base_url, known_project_keys=known_project_keys
             )
 
-        if m.group("wiki_mention_id") is not None:
+        if m.group("escaped") is not None:
+            # The escaped character is literal text: emit it without letting
+            # it open a marker. Issue-key autolinking is skipped -- a single
+            # punctuation character can never be a key.
+            had_escape = True
+            nodes.append({"type": "text", "text": m.group("escaped")})
+        elif m.group("wiki_mention_id") is not None:
             nodes.append(
                 {
                     "type": "mention",
@@ -251,21 +321,32 @@ def _parse_inline_formatting(
                     "marks": [{"type": "code"}],
                 }
             )
+        elif m.group("bold_italic_inner") is not None:
+            nodes.extend(
+                _parse_marked_span(
+                    m.group("bold_italic_inner"),
+                    [{"type": "strong"}, {"type": "em"}],
+                    jira_base_url,
+                    known_project_keys,
+                )
+            )
         elif m.group("bold_inner") is not None:
-            _append_text_nodes(
-                nodes,
-                m.group("bold_inner"),
-                jira_base_url,
-                [{"type": "strong"}],
-                known_project_keys,
+            nodes.extend(
+                _parse_marked_span(
+                    m.group("bold_inner"),
+                    [{"type": "strong"}],
+                    jira_base_url,
+                    known_project_keys,
+                )
             )
         elif m.group("strike_inner") is not None:
-            _append_text_nodes(
-                nodes,
-                m.group("strike_inner"),
-                jira_base_url,
-                [{"type": "strike"}],
-                known_project_keys,
+            nodes.extend(
+                _parse_marked_span(
+                    m.group("strike_inner"),
+                    [{"type": "strike"}],
+                    jira_base_url,
+                    known_project_keys,
+                )
             )
         elif m.group("link_text") is not None:
             link_mark: dict[str, Any] = {
@@ -283,12 +364,13 @@ def _parse_inline_formatting(
                 )
             )
         elif m.group("italic_inner") is not None:
-            _append_text_nodes(
-                nodes,
-                m.group("italic_inner"),
-                jira_base_url,
-                [{"type": "em"}],
-                known_project_keys,
+            nodes.extend(
+                _parse_marked_span(
+                    m.group("italic_inner"),
+                    [{"type": "em"}],
+                    jira_base_url,
+                    known_project_keys,
+                )
             )
 
         pos = m.end()
@@ -306,7 +388,36 @@ def _parse_inline_formatting(
             nodes, text, jira_base_url, known_project_keys=known_project_keys
         )
 
+    if had_escape:
+        # An escape splits what was one run of prose into three nodes ("2 ",
+        # "*", " 3"). Only text that escaped something is stitched back, so
+        # input without an escape keeps converting node-for-node as before.
+        nodes = _merge_adjacent_text_nodes(nodes)
+
     return nodes
+
+
+def _merge_adjacent_text_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Join neighbouring text nodes that carry identical marks.
+
+    Args:
+        nodes: Inline nodes, in document order.
+
+    Returns:
+        An equivalent list with adjacent same-marked text runs concatenated.
+    """
+    merged: list[dict[str, Any]] = []
+    for node in nodes:
+        if (
+            merged
+            and node.get("type") == "text"
+            and merged[-1].get("type") == "text"
+            and merged[-1].get("marks", []) == node.get("marks", [])
+        ):
+            merged[-1] = {**merged[-1], "text": merged[-1]["text"] + node["text"]}
+            continue
+        merged.append(node)
+    return merged
 
 
 def _make_paragraph(
@@ -381,6 +492,188 @@ def _make_task_item(
     }
 
 
+def _list_indent_width(indent: str) -> int:
+    """Measure a list marker's indentation, counting a tab as four columns."""
+    return len(indent.expandtabs(4))
+
+
+def _parse_list_block(
+    lines: list[str],
+    start: int,
+    jira_base_url: str = "",
+    known_project_keys: set[str] | None = None,
+) -> tuple[dict[str, Any], int]:
+    """Parse one list, nesting a deeper-indented list inside its parent item.
+
+    Both markers are handled here so that indentation means the same thing to
+    each: a line indented past the current level opens a sub-list attached to
+    the item above it, which is how ADF spells nesting (a ``bulletList`` inside
+    a ``listItem``). Switching marker kind at one level ends the list, so
+    ``- a`` followed by ``1. b`` stays two lists.
+
+    A blank line between two ordered items is tolerated -- Markdown calls that
+    a loose list and Jira renders one list -- while a blank line ends a bullet
+    list, which is the behaviour this module already had.
+
+    Lines indented past the marker that are not themselves list lines are the
+    item's continuation blocks, and are parsed as their own document so that a
+    second paragraph or a code block inside an item stays inside it. An ADF
+    ``listItem`` holds one or more blocks, so a multi-paragraph item is
+    ordinary content and not an edge case.
+
+    An ordered list whose first marker is not ``1`` carries that number as its
+    ``order`` attr, which is what ADF uses for the starting number.
+
+    Args:
+        lines: All lines of the document being converted.
+        start: Index of the first list line; its indentation sets the level.
+        jira_base_url: Jira base URL used to link bare issue keys.
+        known_project_keys: Normalized allowlist of project keys whose issue
+            keys may be linked; None links every issue-key-shaped token.
+
+    Returns:
+        The list node and the index of the first line after the list.
+    """
+    first = _LIST_LINE_PATTERN.match(lines[start])
+    if first is None:  # pragma: no cover - callers match the pattern first
+        return {"type": "bulletList", "content": []}, start + 1
+
+    base_indent = _list_indent_width(first.group("indent"))
+    ordered = first.group("marker") not in ("-", "*")
+    items: list[dict[str, Any]] = []
+    index = start
+
+    while index < len(lines):
+        match = _LIST_LINE_PATTERN.match(lines[index])
+        if match is None:
+            if (
+                ordered
+                and not lines[index].strip()
+                and index + 1 < len(lines)
+                and (following := _LIST_LINE_PATTERN.match(lines[index + 1]))
+                and _list_indent_width(following.group("indent")) == base_indent
+                and following.group("marker") not in ("-", "*")
+            ):
+                index += 1
+                continue
+            break
+
+        indent = _list_indent_width(match.group("indent"))
+        if indent < base_indent:
+            break
+        if indent > base_indent:
+            if not items:
+                break
+            nested, index = _parse_list_block(
+                lines, index, jira_base_url, known_project_keys
+            )
+            items[-1]["content"].append(nested)
+            # A block after the sub-list is still the outer item's, so the
+            # continuation scan runs again rather than letting it fall out of
+            # the list.
+            index = _absorb_list_item_continuation(
+                lines,
+                index,
+                base_indent,
+                items[-1],
+                jira_base_url,
+                known_project_keys,
+            )
+            continue
+        if (match.group("marker") not in ("-", "*")) != ordered:
+            break
+
+        items.append(
+            _make_list_item(match.group("text"), jira_base_url, known_project_keys)
+        )
+        index += 1
+        index = _absorb_list_item_continuation(
+            lines, index, base_indent, items[-1], jira_base_url, known_project_keys
+        )
+
+    node: dict[str, Any] = {
+        "type": "orderedList" if ordered else "bulletList",
+        "content": items,
+    }
+    if ordered:
+        try:
+            first_number = int(first.group("marker").rstrip("."))
+        except ValueError:  # pragma: no cover - the pattern guarantees digits
+            first_number = 1
+        if first_number != 1:
+            node["attrs"] = {"order": first_number}
+    return node, index
+
+
+def _absorb_list_item_continuation(
+    lines: list[str],
+    index: int,
+    base_indent: int,
+    item: dict[str, Any],
+    jira_base_url: str = "",
+    known_project_keys: set[str] | None = None,
+) -> int:
+    """Attach an item's indented continuation blocks to it.
+
+    A line indented past the marker that is not itself a list line continues
+    the item above -- a second paragraph, a code block, a quote. Blank lines are
+    kept only when indented content follows them, so a blank line that really
+    ends the list still ends it. The collected lines are dedented by their own
+    smallest indent, which keeps indentation *inside* a continuation code block
+    intact, and parsed as their own document.
+
+    Args:
+        lines: All lines of the document being converted.
+        index: Index of the first line after the item's marker line.
+        base_indent: Indentation of the marker that owns these lines.
+        item: The ``listItem`` node to extend; mutated in place.
+        jira_base_url: Jira base URL used to link bare issue keys.
+        known_project_keys: Normalized allowlist of project keys whose issue
+            keys may be linked; None links every issue-key-shaped token.
+
+    Returns:
+        Index of the first line that does not belong to the item.
+    """
+    collected: list[str] = []
+    cursor = index
+    while cursor < len(lines):
+        line = lines[cursor]
+        if not line.strip():
+            lookahead = cursor
+            while lookahead < len(lines) and not lines[lookahead].strip():
+                lookahead += 1
+            if lookahead >= len(lines):
+                break
+            following = lines[lookahead]
+            if (
+                _LIST_LINE_PATTERN.match(following)
+                or _list_indent_width(
+                    following[: len(following) - len(following.lstrip())]
+                )
+                <= base_indent
+            ):
+                break
+            collected.extend([""] * (lookahead - cursor))
+            cursor = lookahead
+            continue
+        if _LIST_LINE_PATTERN.match(line):
+            break
+        if _list_indent_width(line[: len(line) - len(line.lstrip())]) <= base_indent:
+            break
+        collected.append(line)
+        cursor += 1
+
+    if not collected:
+        return index
+
+    body = [line for line in collected if line.strip()]
+    strip_width = min(len(line) - len(line.lstrip()) for line in body)
+    dedented = [line[strip_width:] if line.strip() else "" for line in collected]
+    inner = markdown_to_adf("\n".join(dedented), jira_base_url, known_project_keys)
+    item["content"].extend(inner["content"])
+    return cursor
+
+
 def _make_code_block(language: str, code_lines: list[str]) -> dict[str, Any]:
     """Create an ADF codeBlock node from a fence's language and body lines.
 
@@ -418,6 +711,12 @@ def _split_table_cells(text: str, delimiter: str) -> list[str]:
     index = 0
     while index < len(text):
         char = text[index]
+        if char == "\\" and index + 1 < len(text):
+            # An escaped character is one unit: ``\|`` is a literal pipe in a
+            # cell, not the delimiter between two cells.
+            buffer.append(text[index : index + 2])
+            index += 2
+            continue
         if char == "`":
             closing = text.find("`", index + 1)
             if closing != -1:
@@ -434,6 +733,41 @@ def _split_table_cells(text: str, delimiter: str) -> list[str]:
             cells.append("".join(buffer))
             buffer = []
             index += len(delimiter)
+            continue
+        buffer.append(char)
+        index += 1
+    cells.append("".join(buffer))
+    return cells
+
+
+def _split_escaped_pipes(text: str) -> list[str]:
+    """Split a Markdown table row on unescaped pipes only.
+
+    ``str.split("|")`` breaks a cell holding an escaped pipe in half, which is
+    exactly what the read path emits for a cell whose text contains one. Input
+    with no backslash in it splits identically to ``str.split``, so a table that
+    never needed an escape keeps converting byte-for-byte as before.
+
+    Args:
+        text: Row body with the outer pipes already removed.
+
+    Returns:
+        Raw cell strings, escapes still in place for the inline parser to
+        resolve; always at least one item.
+    """
+    cells: list[str] = []
+    buffer: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and index + 1 < len(text):
+            buffer.append(text[index : index + 2])
+            index += 2
+            continue
+        if char == "|":
+            cells.append("".join(buffer))
+            buffer = []
+            index += 1
             continue
         buffer.append(char)
         index += 1
@@ -535,7 +869,7 @@ def _build_table_node(
         elif has_wiki_header:
             cells = [c.strip() for c in _split_table_cells(line.strip("|"), "|")]
         else:
-            cells = [c.strip() for c in line.strip("|").split("|")]
+            cells = [c.strip() for c in _split_escaped_pipes(line.strip("|"))]
         parsed_rows.append((wiki_cells is not None, cells))
 
     widths = {len(cells) for _, cells in parsed_rows}
@@ -595,13 +929,26 @@ def _collect_fence_lines(lines: list[str], start: int) -> tuple[list[str], int]:
         lines: All lines of the document being converted.
         start: Index of the opening fence line.
 
+    A fence opened inside the body is counted, so a panel or expand nested in
+    an expand closes with its own delimiter instead of the inner one ending the
+    outer block and leaving a stray ``:::`` paragraph behind. Both delimiters
+    are spelled ``:::``, so depth is the only way to tell them apart.
+
     Returns:
         The body lines (opening and closing fence excluded) and the index of
         the first line after the fence.
     """
     body: list[str] = []
     index = start + 1
-    while index < len(lines) and lines[index].strip() != ":::":
+    depth = 1
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if stripped == ":::":
+            depth -= 1
+            if depth == 0:
+                break
+        elif _NESTED_FENCE_OPEN_PATTERN.match(stripped):
+            depth += 1
         body.append(lines[index])
         index += 1
     # Skip the closing :::
@@ -618,16 +965,27 @@ def _collect_code_fence(lines: list[str], start: int) -> tuple[str, list[str], i
             when the fence sits inside a blockquote.
         start: Index of the opening fence line.
 
+    The fence may be longer than three backticks, and only a run at least as
+    long closes it. That is what lets a code block whose body contains a
+    ``` line survive: the read path opens a longer fence for exactly that case,
+    and a three-backtick line inside it is then body text rather than the end
+    of the block.
+
     Returns:
         The fence's language (empty when unlabelled), its body lines verbatim
         -- internal indentation and blank lines included -- and the index of
         the first line after the fence. An unterminated fence runs to the end
         of the input.
     """
-    language = lines[start][3:].strip()
+    opening = _CODE_FENCE_PATTERN.match(lines[start])
+    fence = opening.group("fence") if opening else "```"
+    language = (opening.group("language") if opening else lines[start][3:]).strip()
     body: list[str] = []
     index = start + 1
-    while index < len(lines) and not lines[index].startswith("```"):
+    while index < len(lines):
+        closing = _CODE_FENCE_PATTERN.match(lines[index])
+        if closing and len(closing.group("fence")) >= len(fence):
+            break
         body.append(lines[index])
         index += 1
     # Skip the closing ```
@@ -646,10 +1004,15 @@ def _parse_quoted_block(
     Jira renders a wiki ``{quote}`` holding a ``{code}`` block as a fence
     inside the quote, and an ADF ``blockquote`` containing a ``codeBlock`` is
     accepted by Cloud (measured), so that fence has to become a real
-    ``codeBlock`` instead of three literal paragraphs. Every other line stays a
-    paragraph: only ``paragraph`` and ``codeBlock`` are known-accepted there, so
-    nothing else is promoted -- this is the opposite of a panel, where a
-    forbidden child is flattened (see ``_flatten_panel_content``).
+    ``codeBlock`` instead of three literal paragraphs.
+
+    A list is promoted too. ``bulletList`` and ``orderedList`` are declared
+    children of ``blockquote`` in the ADF schema -- unlike ``blockquote`` and
+    ``panel`` inside a ``panel``, which the schema does not allow and Cloud
+    rejects with an opaque 400 (see ``_flatten_panel_content``). Leaving a list
+    line as a paragraph would store ``- x`` as literal text, which is what the
+    read path would then show. Nothing beyond these three is promoted: a
+    construct the schema does not place here stays a paragraph.
 
     A blank line separates paragraphs outside a fence and is literal content
     inside one.
@@ -671,6 +1034,12 @@ def _parse_quoted_block(
         if line.startswith("```"):
             language, code_lines, index = _collect_code_fence(quote_lines, index)
             content.append(_make_code_block(language, code_lines))
+            continue
+        if _LIST_LINE_PATTERN.match(line) and not line[:1].isspace():
+            list_node, index = _parse_list_block(
+                quote_lines, index, jira_base_url, known_project_keys
+            )
+            content.append(list_node)
             continue
         if line.strip():
             content.append(_make_paragraph(line, jira_base_url, known_project_keys))
@@ -949,35 +1318,14 @@ def markdown_to_adf(
                 doc["content"].append(panel_node)
                 continue
 
-        # --- Unordered list ---
-        if re.match(r"^[-*]\s+", line):
-            items: list[dict[str, Any]] = []
-            while i < len(lines) and re.match(r"^[-*]\s+", lines[i]):
-                item_text = re.sub(r"^[-*]\s+", "", lines[i])
-                items.append(_make_list_item(item_text, jira_base_url, project_keys))
-                i += 1
-            doc["content"].append({"type": "bulletList", "content": items})
-            continue
-
-        # --- Ordered list ---
-        if re.match(r"^\d+\.\s+", line):
-            items_ol: list[dict[str, Any]] = []
-            while i < len(lines):
-                if re.match(r"^\d+\.\s+", lines[i]):
-                    item_text = re.sub(r"^\d+\.\s+", "", lines[i])
-                    items_ol.append(
-                        _make_list_item(item_text, jira_base_url, project_keys)
-                    )
-                    i += 1
-                elif (
-                    not lines[i].strip()
-                    and i + 1 < len(lines)
-                    and re.match(r"^\d+\.\s+", lines[i + 1])
-                ):
-                    i += 1
-                else:
-                    break
-            doc["content"].append({"type": "orderedList", "content": items_ol})
+        # --- List (unordered or ordered, nested by indentation) ---
+        # The marker must sit at column zero to start a list, which is what
+        # this parser has always required; indentation only means nesting once
+        # a list is open, so an indented line in running prose stays a
+        # paragraph.
+        if _LIST_LINE_PATTERN.match(line) and not line[:1].isspace():
+            list_node, i = _parse_list_block(lines, i, jira_base_url, project_keys)
+            doc["content"].append(list_node)
             continue
 
         # --- Table (Markdown "|a|b|" or Jira wiki "||a||b||") ---
@@ -1076,6 +1424,612 @@ def merge_adf_with_preserved_media(
     return merged
 
 
+def _escape_inline_markdown(text: str) -> str:
+    """Escape the characters ``_parse_inline_formatting`` would otherwise consume.
+
+    Only the metacharacters that parser actually reads are escaped, so the
+    output stays legible: a backslash (which introduces an escape), ``*``
+    (bold and italic), a backtick (code), both brackets (links and the two
+    mention spellings -- the closing one matters inside a link label, where an
+    unescaped ``]`` would end the label early and lose the link) and the first
+    ``~`` of a ``~~`` run (strikethrough). ``_`` is
+    deliberately left alone -- the writer does not read it as emphasis, so
+    escaping it would only add noise to ``snake_case`` prose.
+
+    Args:
+        text: Literal text from an ADF ``text`` node.
+
+    Returns:
+        The same text, safe to re-parse as Markdown.
+    """
+    return re.sub(r"[\\`*\[\]]|~(?=~)", lambda m: "\\" + m.group(0), text)
+
+
+def _escape_block_start(line: str) -> str:
+    """Escape a line that would otherwise re-parse as a block construct.
+
+    A paragraph whose text happens to begin with ``- ``, ``# `` or ``|`` is
+    prose, not a list, heading or table. Inline escaping has already dealt with
+    ``*`` and backticks, so only the markers that are literal characters
+    elsewhere are handled here.
+
+    Args:
+        line: One already-inline-escaped rendered line.
+
+    Returns:
+        The line, with a backslash prefixed when it needs one.
+    """
+    ordered = _ORDERED_START_PATTERN.match(line)
+    if ordered:
+        # The backslash has to land on the punctuation, not on the digit: a
+        # digit is not escapable, so ``\1.`` would keep its backslash as text
+        # while ``1\.`` unescapes back to the prose it came from.
+        cut = ordered.end("number")
+        return f"{line[:cut]}\\{line[cut:]}"
+    if _BLOCK_START_PATTERN.match(line):
+        return "\\" + line
+    return line
+
+
+def _render_inline_nodes(nodes: list[Any]) -> str:
+    """Render a run of ADF inline nodes as Markdown.
+
+    Args:
+        nodes: Inline node list (``text``, ``hardBreak``, ``mention``, ...).
+
+    Returns:
+        Markdown for the run; the empty string when nothing renders.
+    """
+    parts: list[str] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        parts.append(_render_inline_node(node))
+    return "".join(parts)
+
+
+def _wrap_marked_text(text: str, opener: str, closer: str) -> str:
+    """Wrap text in an emphasis marker, keeping surrounding spaces outside.
+
+    ``** bold **`` is not emphasis in most Markdown readers, and Jira's own
+    renderer agrees, so the padding is moved out of the marker.
+
+    Args:
+        text: Already-escaped text to wrap.
+        opener: Opening marker, e.g. ``"**"``.
+        closer: Closing marker.
+
+    Returns:
+        The wrapped text, or the input unchanged when it holds no non-space.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return text
+    lead = text[: len(text) - len(text.lstrip())]
+    trail = text[len(text.rstrip()) :]
+    return f"{lead}{opener}{stripped}{closer}{trail}"
+
+
+def _render_inline_node(node: dict[str, Any]) -> str:
+    """Render one ADF inline node as Markdown.
+
+    Marks are applied innermost-first: ``code`` wins outright, because the
+    writer's inline parser reads a backtick span verbatim and cannot nest
+    emphasis inside one -- emitting ``**`x`**`` would put literal backticks in
+    the stored text. Emphasis then nests inside a link, which is the one
+    spelling the writer parses recursively.
+
+    Args:
+        node: Inline ADF node.
+
+    Returns:
+        Markdown for the node; the empty string when it carries nothing.
+    """
+    node_type = node.get("type")
+
+    if node_type == "text":
+        text = node.get("text", "")
+        if not isinstance(text, str):
+            return ""
+        marks = {
+            mark.get("type"): mark
+            for mark in _adf_marks(node)
+            if isinstance(mark, dict)
+        }
+        if "code" in marks:
+            # Backtick spans are verbatim on the way back in, so the content is
+            # left unescaped; a span holding a backtick cannot be expressed and
+            # is emitted as-is.
+            rendered = f"`{text}`" if text.strip() else text
+        else:
+            rendered = _escape_inline_markdown(text)
+            if "strike" in marks:
+                rendered = _wrap_marked_text(rendered, "~~", "~~")
+            if "em" in marks:
+                rendered = _wrap_marked_text(rendered, "*", "*")
+            if "strong" in marks:
+                rendered = _wrap_marked_text(rendered, "**", "**")
+        link = marks.get("link")
+        if isinstance(link, dict) and rendered:
+            href = _adf_attrs(link).get("href")
+            if href:
+                rendered = f"[{rendered}]({href})"
+        return rendered
+
+    if node_type == "hardBreak":
+        return "\n"
+
+    if node_type == "mention":
+        attrs = _adf_attrs(node)
+        account_id = attrs.get("id", "")
+        text = attrs.get("text") or ""
+        if text:
+            # Both spellings are parsed back into a mention node; this one also
+            # carries the display name, so the read stays readable.
+            return f"@[{text.lstrip('@')}](accountid:{account_id})"
+        return f"[~accountid:{account_id}]"
+
+    if node_type == "emoji":
+        attrs = _adf_attrs(node)
+        return str(attrs.get("text") or attrs.get("shortName") or "")
+
+    if node_type == "date":
+        attrs = _adf_attrs(node)
+        timestamp = attrs.get("timestamp")
+        if timestamp:
+            try:
+                dt = datetime.fromtimestamp(int(timestamp) / 1000, tz=timezone.utc)
+                return dt.strftime("%Y-%m-%d")
+            except (ValueError, OSError, TypeError, OverflowError):
+                return str(timestamp)
+        return ""
+
+    if node_type == "status":
+        attrs = _adf_attrs(node)
+        # The bracket is escaped so that a status followed by parenthesised
+        # prose cannot re-parse as a Markdown link.
+        return f"\\[{_escape_inline_markdown(str(attrs.get('text', '')))}\\]"
+
+    if node_type == "inlineCard":
+        attrs = _adf_attrs(node)
+        url = attrs.get("url") or (attrs.get("data") or {}).get("url")
+        name = (attrs.get("data") or {}).get("name")
+        if url and name:
+            return f"[{_escape_inline_markdown(str(name))}]({url})"
+        if url:
+            return str(url)
+        return str(name or "")
+
+    if node_type in _MEDIA_NODE_TYPES:
+        return _render_media_marker(node)
+
+    # Unknown inline node: keep whatever text it wraps rather than dropping it.
+    children = _adf_children(node)
+    return _render_inline_nodes(children) if children else ""
+
+
+def _render_media_marker(node: dict[str, Any]) -> str:
+    """Describe a media node in plain text.
+
+    Neither an attachment nor an embedded image can be rebuilt from Markdown,
+    and the write path re-attaches the real nodes itself (see
+    ``merge_adf_with_preserved_media``), so the read emits a marker that
+    carries no Markdown metacharacters and therefore survives a rewrite as
+    plain prose.
+
+    Args:
+        node: A ``media``, ``mediaSingle`` or ``mediaGroup`` node.
+
+    Returns:
+        A parenthesised marker naming the media, e.g. ``(media: diagram.png)``.
+    """
+    names: list[str] = []
+    stack: list[dict[str, Any]] = [node]
+    while stack:
+        current = stack.pop()
+        if current.get("type") == "media":
+            attrs = _adf_attrs(current)
+            name = attrs.get("alt") or attrs.get("id") or "attachment"
+            names.append(str(name))
+        stack.extend(
+            child for child in _adf_children(current) if isinstance(child, dict)
+        )
+    if not names:
+        return "(media)"
+    return " ".join(f"(media: {name})" for name in names)
+
+
+def _adf_children(node: dict[str, Any]) -> list[Any]:
+    """Return a node's content list, or an empty list when it has none."""
+    content = node.get("content")
+    return content if isinstance(content, list) else []
+
+
+def _adf_attrs(node: dict[str, Any]) -> dict[str, Any]:
+    """Return a node's attrs, or an empty dict when they are missing or junk.
+
+    ``node.get("attrs") or {}`` is not enough: a truthy non-dict value (an ADF
+    document is JSON from a remote service, so ``"attrs": "oops"`` is possible)
+    would pass that guard and raise ``AttributeError`` on the next ``.get``.
+    This read path runs on every issue fetch, so it degrades instead.
+    """
+    attrs = node.get("attrs")
+    return attrs if isinstance(attrs, dict) else {}
+
+
+def _adf_marks(node: dict[str, Any]) -> list[Any]:
+    """Return a node's marks, or an empty list when they are missing or junk."""
+    marks = node.get("marks")
+    return marks if isinstance(marks, list) else []
+
+
+def _render_paragraph(node: dict[str, Any]) -> str:
+    """Render a paragraph, escaping every line that could re-parse as a block."""
+    rendered = _render_inline_nodes(_adf_children(node))
+    return "\n".join(_escape_block_start(line) for line in rendered.split("\n"))
+
+
+def _render_code_block(node: dict[str, Any]) -> str:
+    """Render a codeBlock as a fenced block, keeping its body verbatim."""
+    attrs = _adf_attrs(node)
+    language = attrs.get("language") or ""
+    body_parts: list[str] = []
+    for child in _adf_children(node):
+        if isinstance(child, dict) and child.get("type") == "text":
+            body_parts.append(str(child.get("text", "")))
+        elif isinstance(child, dict) and child.get("type") == "hardBreak":
+            body_parts.append("\n")
+    body = "".join(body_parts)
+    # A ``` line inside the body would close a three-backtick fence, splitting
+    # one code block into two and a paragraph. Opening a longer fence keeps it
+    # body text; _collect_code_fence closes only on a run at least as long.
+    longest_run = max(
+        (len(match.group(0)) for match in re.finditer(r"^`{3,}", body, re.MULTILINE)),
+        default=0,
+    )
+    fence = "`" * max(3, longest_run + 1)
+    return f"{fence}{language}\n{body}\n{fence}"
+
+
+def _render_blockquote(node: dict[str, Any]) -> str:
+    """Render a blockquote, prefixing every line -- blank ones included.
+
+    The writer holds a blockquote together only while consecutive lines start
+    with ``"> "``, so an interior blank line keeps its marker instead of
+    ending the quote.
+    """
+    body = _render_block_nodes(_adf_children(node))
+    if not body:
+        return "> "
+    # A blank line keeps the marker *and* its space: the writer holds the quote
+    # together only while every line starts with exactly "> ", and a bare ">"
+    # would end it, splitting one quote into two with a ">" paragraph between.
+    return "\n".join(f"> {line}" if line else "> " for line in body.split("\n"))
+
+
+def _render_panel(node: dict[str, Any]) -> str:
+    """Render a panel as the ``:::<type>`` fence the writer parses back."""
+    attrs = _adf_attrs(node)
+    panel_type = str(attrs.get("panelType") or "info").lower()
+    if panel_type not in _PANEL_TYPES:
+        # "custom" (and anything newer) has no fence of its own; info is the
+        # neutral one and still round-trips as a panel.
+        panel_type = "info"
+    body = _render_block_nodes(_adf_children(node))
+    return f":::{panel_type}\n{body}\n:::" if body else f":::{panel_type}\n:::"
+
+
+def _render_expand(node: dict[str, Any]) -> str:
+    """Render an expand (or nestedExpand) as the ``:::expand`` fence."""
+    attrs = _adf_attrs(node)
+    title = str(attrs.get("title") or "").strip()
+    opener = f":::expand {title}" if title else ":::expand"
+    body = _render_block_nodes(_adf_children(node))
+    return f"{opener}\n{body}\n:::" if body else f"{opener}\n:::"
+
+
+def _indent_continuation(marker: str, body: str) -> str:
+    """Put the first body line after a list marker and indent the rest under it.
+
+    Args:
+        marker: List marker including its trailing space, e.g. ``"- "``.
+        body: Rendered body of the item, possibly several lines.
+
+    Returns:
+        The item's lines, aligned under the marker.
+    """
+    lines = body.split("\n")
+    padding = " " * len(marker)
+    first = f"{marker}{lines[0]}"
+    return "\n".join(
+        [first, *(f"{padding}{line}" if line else "" for line in lines[1:])]
+    )
+
+
+def _render_list_item_body(item: dict[str, Any]) -> str:
+    """Render one listItem's blocks, keeping a nested list attached to it."""
+    parts: list[str] = []
+    for child in _adf_children(item):
+        if not isinstance(child, dict):
+            continue
+        rendered = _render_block(child)
+        if rendered is None:
+            continue
+        parts.append(rendered)
+    if not parts:
+        return ""
+    # A nested list follows its parent item directly; anything else is a
+    # separate block and keeps a blank line before it.
+    body = parts[0]
+    for part in parts[1:]:
+        separator = "\n" if _LIST_ITEM_START_PATTERN.match(part.lstrip()) else "\n\n"
+        body += separator + part
+    return body
+
+
+def _render_list(node: dict[str, Any], *, ordered: bool) -> str:
+    """Render a bulletList or orderedList, nesting by indentation."""
+    number = 1
+    if ordered:
+        attrs = _adf_attrs(node)
+        try:
+            number = int(attrs.get("order", 1) or 1)
+        except (TypeError, ValueError):
+            number = 1
+
+    lines: list[str] = []
+    for item in _adf_children(node):
+        if not isinstance(item, dict):
+            continue
+        body = _render_list_item_body(item)
+        marker = f"{number}. " if ordered else "- "
+        if ordered:
+            number += 1
+        lines.append(_indent_continuation(marker, body))
+    return "\n".join(lines)
+
+
+def _render_task_list(node: dict[str, Any]) -> str:
+    """Render a taskList as ``- [ ]`` / ``- [x]`` items, at one level.
+
+    A nested taskList is flattened into its parent rather than indented. The
+    writer recognises a checkbox only at the start of a line, so an indented
+    ``- [x]`` would come back as a paragraph holding that text literally --
+    losing the checkbox as well as the nesting. Flattening loses only the
+    nesting.
+    """
+    lines: list[str] = []
+    for item in _adf_children(node):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "taskList":
+            nested = _render_task_list(item)
+            lines.extend(line for line in nested.split("\n") if line)
+            continue
+        if item.get("type") != "taskItem":
+            continue
+        attrs = _adf_attrs(item)
+        checked = str(attrs.get("state", "")).upper() == "DONE"
+        inline_children = [
+            child
+            for child in _adf_children(item)
+            if isinstance(child, dict) and child.get("type") != "taskList"
+        ]
+        marker = "- [x] " if checked else "- [ ] "
+        lines.append(f"{marker}{_render_inline_nodes(inline_children)}")
+        for child in _adf_children(item):
+            if isinstance(child, dict) and child.get("type") == "taskList":
+                nested = _render_task_list(child)
+                lines.extend(line for line in nested.split("\n") if line)
+    return "\n".join(lines)
+
+
+def _render_table_cell(cell: dict[str, Any]) -> str:
+    """Flatten one table cell to a single Markdown line.
+
+    A pipe table row is one line, so a cell holding several blocks is joined
+    with spaces and its pipes are escaped.
+    """
+    body = _render_block_nodes(_adf_children(cell))
+    flattened = " ".join(part for part in body.split("\n") if part.strip())
+    return flattened.replace("|", "\\|").strip()
+
+
+def _render_table(node: dict[str, Any]) -> str | None:
+    """Render a table as a Markdown pipe table.
+
+    The writer reads the first row as the header row, which is what Jira's own
+    tables carry, so the header separator is always emitted after row one. A
+    table whose first row holds no ``tableHeader`` cell therefore gains a
+    header on a rewrite -- ADF can express a headerless table and Markdown
+    cannot.
+    """
+    rows: list[list[str]] = []
+    for row in _adf_children(node):
+        if not isinstance(row, dict) or row.get("type") != "tableRow":
+            continue
+        cells = [
+            _render_table_cell(cell)
+            for cell in _adf_children(row)
+            if isinstance(cell, dict)
+        ]
+        rows.append(cells)
+
+    rows = [row for row in rows if row]
+    if not rows:
+        return None
+
+    width = max(len(row) for row in rows)
+    padded = [row + [""] * (width - len(row)) for row in rows]
+    lines = ["| " + " | ".join(padded[0]) + " |"]
+    lines.append("|" + "|".join([" --- "] * width) + "|")
+    lines.extend("| " + " | ".join(row) + " |" for row in padded[1:])
+    return "\n".join(lines)
+
+
+def _render_block(node: dict[str, Any]) -> str | None:
+    """Render one block-level ADF node as Markdown.
+
+    Args:
+        node: Block-level ADF node.
+
+    Returns:
+        Markdown for the node, or None when it contributes nothing.
+    """
+    node_type = node.get("type")
+
+    if node_type == "paragraph":
+        return _render_paragraph(node)
+
+    if node_type == "heading":
+        attrs = _adf_attrs(node)
+        try:
+            level = int(attrs.get("level", 1) or 1)
+        except (TypeError, ValueError):
+            level = 1
+        level = min(max(level, 1), 6)
+        return f"{'#' * level} {_render_inline_nodes(_adf_children(node))}".rstrip()
+
+    if node_type == "codeBlock":
+        return _render_code_block(node)
+
+    if node_type == "blockquote":
+        return _render_blockquote(node)
+
+    if node_type == "panel":
+        return _render_panel(node)
+
+    if node_type in ("expand", "nestedExpand"):
+        return _render_expand(node)
+
+    if node_type == "bulletList":
+        return _render_list(node, ordered=False) or None
+
+    if node_type == "orderedList":
+        return _render_list(node, ordered=True) or None
+
+    if node_type == "taskList":
+        return _render_task_list(node) or None
+
+    if node_type == "table":
+        return _render_table(node)
+
+    if node_type == "rule":
+        return "---"
+
+    if node_type in _MEDIA_NODE_TYPES:
+        return _render_media_marker(node)
+
+    if node_type in ("layoutSection", "layoutColumn", "bodiedExtension", "extension"):
+        # A layout carries no Markdown meaning; its columns are emitted one
+        # after another.
+        return _render_block_nodes(_adf_children(node)) or None
+
+    if node_type in ("decisionList", "decisionItem"):
+        if node_type == "decisionItem":
+            return f"- {_render_inline_nodes(_adf_children(node))}"
+        rendered = [
+            _render_block(child)
+            for child in _adf_children(node)
+            if isinstance(child, dict)
+        ]
+        return "\n".join(part for part in rendered if part) or None
+
+    children = _adf_children(node)
+    if children:
+        # An unknown wrapper still has its content read, so a node type this
+        # module has not met yet degrades to its text instead of vanishing.
+        if all(
+            isinstance(child, dict)
+            and child.get("type") in ("text", "hardBreak", "mention", "emoji")
+            for child in children
+        ):
+            return _render_paragraph(node)
+        return _render_block_nodes(children) or None
+
+    return None
+
+
+def _render_block_nodes(nodes: list[Any]) -> str:
+    """Render a list of block nodes, separated by a blank line."""
+    rendered: list[str] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        block = _render_block(node)
+        if block is None:
+            continue
+        rendered.append(block)
+    return "\n\n".join(rendered)
+
+
+def adf_to_markdown(adf_content: dict | list | str | None) -> str | None:
+    """Convert an ADF document to the Markdown this module also parses.
+
+    This is the inverse of :func:`markdown_to_adf`, and deliberately emits only
+    the vocabulary that function reads back -- ``:::info``/``:::note``/
+    ``:::warning``/``:::success``/``:::error`` panels, ``:::expand <title>``,
+    ``> `` quotes, fenced code, pipe tables, ``- ``/``1. `` lists and
+    ``- [ ]`` tasks -- so that one read+write cycle is a fixed point. Text is
+    escaped for the same reason: the writer understands a backslash escape, so
+    prose containing ``*`` or a backtick survives a rewrite as prose.
+
+    Unlike :func:`adf_to_text`, which flattens everything to bare text, this
+    keeps the document's structure. Prefer it for anything a user or an agent
+    reads; ``adf_to_text`` remains for callers that want no markup at all.
+
+    Known lossy edges, all measured against the writer:
+
+    * a text node carrying both ``code`` and an emphasis mark keeps only the
+      code span, because Markdown cannot nest emphasis inside a backtick span
+      that Jira reads verbatim;
+    * ``underline``, ``textColor`` and ``subsup`` marks have no Markdown
+      spelling and are emitted as plain text;
+    * a ``hardBreak`` becomes a newline, which a rewrite stores as two
+      paragraphs rather than one paragraph with a break in it;
+    * whitespace padding an emphasis mark (``em`` over ``" x "``) moves outside
+      the marker, because ``** x **`` is not emphasis to a Markdown reader; the
+      rendering is unchanged but the mark's text loses the spaces;
+    * a ``status`` node degrades to bracketed text and an ``inlineCard`` to a
+      link or a bare URL, neither of which is rebuilt as its own node;
+    * media becomes a ``(media: ...)`` marker -- the write path re-attaches
+      the real nodes instead of rebuilding them from text;
+    * a table whose first row is not a header row gains one on a rewrite, and a
+      cell holding several blocks is flattened onto the row's single line;
+    * a ``nestedExpand`` comes back as an ``expand``, which is the same block
+      with the same title;
+    * a nested ``taskList`` is flattened to one level of checkboxes, because an
+      indented checkbox is not one to the writer;
+    * a URL containing ``)`` ends the link early on the way back in, because
+      the writer reads an href as ``[^)]+``.
+
+    Args:
+        adf_content: ADF document (dict), content list, string, or None.
+
+    Returns:
+        Markdown text, or None when the input is None. A document with no
+        renderable content yields the empty string.
+    """
+    if adf_content is None:
+        return None
+
+    if isinstance(adf_content, str):
+        return adf_content
+
+    if isinstance(adf_content, list):
+        return _render_block_nodes(adf_content)
+
+    if isinstance(adf_content, dict):
+        if adf_content.get("type") == "doc":
+            return _render_block_nodes(_adf_children(adf_content))
+        rendered = _render_block(adf_content)
+        if rendered is not None:
+            return rendered
+        return _render_inline_node(adf_content)
+
+    return None
+
+
 def adf_to_text(adf_content: dict | list | str | None) -> str | None:
     """
     Convert Atlassian Document Format (ADF) content to plain text.
@@ -1114,17 +2068,17 @@ def adf_to_text(adf_content: dict | list | str | None) -> str | None:
 
         # Check if this is a mention node
         if adf_content.get("type") == "mention":
-            attrs = adf_content.get("attrs", {})
+            attrs = _adf_attrs(adf_content)
             return attrs.get("text") or f"@{attrs.get('id', 'unknown')}"
 
         # Check if this is an emoji node
         if adf_content.get("type") == "emoji":
-            attrs = adf_content.get("attrs", {})
+            attrs = _adf_attrs(adf_content)
             return attrs.get("text") or attrs.get("shortName", "")
 
         # Check if this is a date node
         if adf_content.get("type") == "date":
-            attrs = adf_content.get("attrs", {})
+            attrs = _adf_attrs(adf_content)
             timestamp = attrs.get("timestamp")
             if timestamp:
                 try:
@@ -1136,12 +2090,12 @@ def adf_to_text(adf_content: dict | list | str | None) -> str | None:
 
         # Check if this is a status node
         if adf_content.get("type") == "status":
-            attrs = adf_content.get("attrs", {})
+            attrs = _adf_attrs(adf_content)
             return f"[{attrs.get('text', '')}]"
 
         # Check if this is an inlineCard node
         if adf_content.get("type") == "inlineCard":
-            attrs = adf_content.get("attrs", {})
+            attrs = _adf_attrs(adf_content)
             url = attrs.get("url")
             if url:
                 return url

@@ -79,15 +79,20 @@ class TestWorklogMixin:
                 }
             ],
         }
-        worklog_mixin.jira.resource_url.return_value = (
-            "https://jira.example.com/rest/api/2/issue"
+        # The fixture is a Cloud instance, so the read goes over v3 — a
+        # worklog comment this server wrote is stored as ADF, and v2 would
+        # hand back Atlassian's wiki rendering of it instead.
+        worklog_mixin.jira.resource_url.side_effect = (
+            lambda resource, api_version=None: (
+                f"https://jira.example.com/rest/api/{api_version or '2'}/{resource}"
+            )
         )
         worklog_mixin.jira.get.return_value = mock_result
 
         result = worklog_mixin.get_worklogs("TEST-123")
 
         worklog_mixin.jira.get.assert_called_once_with(
-            "https://jira.example.com/rest/api/2/issue/TEST-123/worklog",
+            "https://jira.example.com/rest/api/3/issue/TEST-123/worklog",
             params={"maxResults": 100, "startAt": 0},
         )
         assert len(result) == 1
@@ -510,3 +515,74 @@ class TestWorklogMixin:
         server_worklog_mixin.jira.resource_url.assert_called_with("issue")
         server_worklog_mixin._post_api3.assert_not_called()
         assert result["id"] == "10003"
+
+    def test_get_worklogs_reads_v2_on_server_dc(self, server_worklog_mixin):
+        """Server/DC has no v3 API, so the worklog read stays on v2."""
+        server_worklog_mixin.jira.resource_url.side_effect = (
+            lambda resource, api_version=None: (
+                f"https://jira.example.com/rest/api/{api_version or '2'}/{resource}"
+            )
+        )
+        server_worklog_mixin.jira.get.return_value = {"total": 0, "worklogs": []}
+
+        server_worklog_mixin.get_worklogs("TEST-123")
+
+        server_worklog_mixin.jira.get.assert_called_once_with(
+            "https://jira.example.com/rest/api/2/issue/TEST-123/worklog",
+            params={"maxResults": 100, "startAt": 0},
+        )
+        for call in server_worklog_mixin.jira.resource_url.call_args_list:
+            assert call.kwargs.get("api_version") != "3"
+
+    def test_an_adf_worklog_comment_is_read_as_markdown(self, worklog_mixin):
+        """A worklog comment written as ADF has to come back as Markdown.
+
+        The wiki preprocessor must not see it: it would read the Markdown as
+        wiki markup and convert it a second time.
+        """
+        worklog_mixin.jira.resource_url.side_effect = (
+            lambda resource, api_version=None: (
+                f"https://jira.example.com/rest/api/{api_version or '2'}/{resource}"
+            )
+        )
+        worklog_mixin.jira.get.return_value = {
+            "total": 1,
+            "worklogs": [
+                {
+                    "id": "10001",
+                    "comment": {
+                        "type": "doc",
+                        "version": 1,
+                        "content": [
+                            {
+                                "type": "bulletList",
+                                "content": [
+                                    {
+                                        "type": "listItem",
+                                        "content": [
+                                            {
+                                                "type": "paragraph",
+                                                "content": [
+                                                    {"type": "text", "text": "fixed it"}
+                                                ],
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    "created": "2024-01-01T10:00:00.000+0000",
+                    "updated": "2024-01-01T10:00:00.000+0000",
+                    "started": "2024-01-01T09:00:00.000+0000",
+                    "timeSpent": "1h",
+                    "timeSpentSeconds": 3600,
+                    "author": {"displayName": "Test User"},
+                }
+            ],
+        }
+
+        result = worklog_mixin.get_worklogs("TEST-123")
+
+        assert result[0]["comment"] == "- fixed it"
+        worklog_mixin._clean_text.assert_not_called()

@@ -1,16 +1,23 @@
 """Integration tests for Jira wiki markup <-> Markdown format conversion.
 
 These tests verify that the format conversion pipeline works end-to-end:
-- Reading from Jira: Wiki markup → Markdown
-- Writing to Jira: Markdown → Wiki markup
+- Reading from Server/DC: Wiki markup → Markdown
+- Reading from Cloud: ADF → Markdown (v3 returns the stored document)
+- Writing to Jira: Markdown → ADF (Cloud) / wiki markup (Server/DC)
 
 This ensures that the conversion functions are actually called in the read/write flow,
 which was broken in PR #72 (March 2025) and went undetected for 11 months.
+
+Which fixture a read test uses is not cosmetic: Cloud is read through
+``/rest/api/3`` and hands back ADF, so wiki markup can only reach the
+preprocessor from a Server/DC instance.
 """
 
 from unittest.mock import Mock
 
 import pytest
+
+from tests.utils.mocks import setup_api3_passthrough_mocks
 
 
 class TestFormatConversionIntegration:
@@ -18,12 +25,29 @@ class TestFormatConversionIntegration:
 
     @pytest.fixture
     def jira_fetcher_with_real_preprocessor(self, jira_fetcher):
-        """Use JiraFetcher with real preprocessor to test actual conversion."""
-        # JiraFetcher already has a real preprocessor, so we just return it
+        """A Cloud JiraFetcher with its real preprocessor.
+
+        Cloud reads go out over ``/rest/api/3``, so ``_get_api3`` is routed
+        back to the ``jira.get_issue`` mock these tests configure. The version
+        actually put on the wire is pinned separately, in
+        ``test_issues.py::TestIssueReadApiVersion``.
+        """
+        setup_api3_passthrough_mocks(jira_fetcher)
+        return jira_fetcher
+
+    @pytest.fixture
+    def dc_fetcher_with_real_preprocessor(self, jira_fetcher):
+        """A Server/DC JiraFetcher with its real preprocessor.
+
+        Server/DC has no v3 API and returns rich text as wiki markup, which is
+        the only way wiki markup now reaches a read.
+        """
+        jira_fetcher.config.url = "https://jira.example.com"
+        assert not jira_fetcher.config.is_cloud
         return jira_fetcher
 
     def test_get_issue_converts_wiki_markup_description_to_markdown(
-        self, jira_fetcher_with_real_preprocessor
+        self, dc_fetcher_with_real_preprocessor
     ):
         """Test that reading an issue converts Jira wiki markup description to Markdown.
 
@@ -31,7 +55,7 @@ class TestFormatConversionIntegration:
         was not being called on descriptions.
         """
         # Mock API response with Jira wiki markup in description
-        jira_fetcher_with_real_preprocessor.jira.get_issue.return_value = {
+        dc_fetcher_with_real_preprocessor.jira.get_issue.return_value = {
             "id": "12345",
             "key": "TEST-123",
             "fields": {
@@ -45,7 +69,7 @@ class TestFormatConversionIntegration:
         }
 
         # Call get_issue
-        result = jira_fetcher_with_real_preprocessor.get_issue("TEST-123")
+        result = dc_fetcher_with_real_preprocessor.get_issue("TEST-123")
 
         # Verify description was converted to Markdown
         assert result.description is not None
@@ -58,7 +82,7 @@ class TestFormatConversionIntegration:
         assert "||" not in result.description
 
     def test_get_issue_converts_wiki_markup_comments_to_markdown(
-        self, jira_fetcher_with_real_preprocessor
+        self, dc_fetcher_with_real_preprocessor
     ):
         """Test that reading issue comments converts Jira wiki markup to Markdown.
 
@@ -66,7 +90,7 @@ class TestFormatConversionIntegration:
         were not being cleaned.
         """
         # Mock API response with Jira wiki markup in comments
-        jira_fetcher_with_real_preprocessor.jira.get_issue.return_value = {
+        dc_fetcher_with_real_preprocessor.jira.get_issue.return_value = {
             "id": "12345",
             "key": "TEST-123",
             "fields": {
@@ -91,7 +115,7 @@ class TestFormatConversionIntegration:
         }
 
         # Need to mock issue_get_comments as well
-        jira_fetcher_with_real_preprocessor.jira.issue_get_comments.return_value = {
+        dc_fetcher_with_real_preprocessor.jira.issue_get_comments.return_value = {
             "comments": [
                 {
                     "id": "10001",
@@ -104,7 +128,7 @@ class TestFormatConversionIntegration:
         }
 
         # Call get_issue with comments
-        result = jira_fetcher_with_real_preprocessor.get_issue(
+        result = dc_fetcher_with_real_preprocessor.get_issue(
             "TEST-123", comment_limit=10
         )
 
@@ -230,7 +254,7 @@ class TestFormatConversionIntegration:
         assert task_list["content"][1]["content"][0]["text"] == "todo"
 
     def test_numbered_list_not_converted_to_heading(
-        self, jira_fetcher_with_real_preprocessor
+        self, dc_fetcher_with_real_preprocessor
     ):
         """Test that Jira numbered lists (# Item) don't get converted to headings (h1.).
 
@@ -245,7 +269,7 @@ class TestFormatConversionIntegration:
         The conversion is idempotent and format-aware.
         """
         # Mock API response with Jira numbered list
-        jira_fetcher_with_real_preprocessor.jira.get_issue.return_value = {
+        dc_fetcher_with_real_preprocessor.jira.get_issue.return_value = {
             "id": "12345",
             "key": "TEST-123",
             "fields": {
@@ -259,7 +283,7 @@ class TestFormatConversionIntegration:
         }
 
         # Call get_issue
-        result = jira_fetcher_with_real_preprocessor.get_issue("TEST-123")
+        result = dc_fetcher_with_real_preprocessor.get_issue("TEST-123")
 
         # Verify numbered list was converted correctly
         assert result.description is not None
@@ -276,14 +300,14 @@ class TestFormatConversionIntegration:
         assert "h1." not in result.description
 
     def test_mixed_jira_and_markdown_handled_correctly(
-        self, jira_fetcher_with_real_preprocessor
+        self, dc_fetcher_with_real_preprocessor
     ):
         """Test that mixed Jira/Markdown content is handled gracefully.
 
         When reading from Jira, we should get clean Markdown.
         """
         # Mock API response with various Jira wiki markup elements
-        jira_fetcher_with_real_preprocessor.jira.get_issue.return_value = {
+        dc_fetcher_with_real_preprocessor.jira.get_issue.return_value = {
             "id": "12345",
             "key": "TEST-123",
             "fields": {
@@ -297,7 +321,7 @@ class TestFormatConversionIntegration:
         }
 
         # Call get_issue
-        result = jira_fetcher_with_real_preprocessor.get_issue("TEST-123")
+        result = dc_fetcher_with_real_preprocessor.get_issue("TEST-123")
 
         # Verify conversion to Markdown
         assert result.description is not None

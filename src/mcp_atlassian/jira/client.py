@@ -28,7 +28,7 @@ from mcp_atlassian.utils.ssrf_adapter import mount_ssrf_pinning
 from mcp_atlassian.utils.urls import make_ssrf_redirect_hook
 from mcp_atlassian.utils.user_agent import get_default_user_agent
 
-from ..models.jira.adf import markdown_to_adf
+from ..models.jira.adf import adf_to_markdown, markdown_to_adf
 from .config import JiraConfig, normalize_project_key
 
 # Configure logging
@@ -341,6 +341,29 @@ class JiraClient:
         _ = self.config.url if hasattr(self, "config") else ""
         return self.preprocessor.clean_jira_text(text)
 
+    def _rich_text_to_markdown(self, raw_value: Any) -> str:
+        """Render a rich-text field, whichever format the API returned.
+
+        An ADF document is rendered straight to Markdown. It must NOT also go
+        through the wiki preprocessor: that converter reads its input as wiki
+        markup, where ``*bold*`` is bold and ``**bold**`` is not, so running it
+        over Markdown converts the text a second time and mangles it. A string
+        value is wiki markup from a v2 endpoint or Server/DC and does need the
+        preprocessor.
+
+        Args:
+            raw_value: Field value as the API returned it -- an ADF dict, a
+                wiki markup string, or None.
+
+        Returns:
+            Markdown text; the empty string when the field was empty.
+        """
+        if isinstance(raw_value, dict):
+            return adf_to_markdown(raw_value) or ""
+        if not raw_value:
+            return ""
+        return self._clean_text(str(raw_value))
+
     def _markdown_to_jira(self, markdown_text: str) -> str | dict[str, Any]:
         """Convert Markdown to Jira format (ADF for Cloud, wiki markup for Server).
 
@@ -433,6 +456,37 @@ class JiraClient:
         """PUT to Jira REST API v3 (required for ADF payloads on Cloud)."""
         url = self.jira.resource_url(resource, api_version="3")
         return self.jira.put(url, data=data)
+
+    def _get_api3(self, resource: str, params: dict[str, Any] | None = None) -> Any:
+        """GET from Jira REST API v3, which returns rich text as ADF.
+
+        The v2 endpoints hand back a *rendering* of the stored ADF in wiki
+        markup, so a read through them can never show what is actually stored
+        and has to be translated by a second, lossy converter. v3 returns the
+        document itself, which ``adf_to_markdown`` renders directly -- the same
+        vocabulary ``markdown_to_adf`` writes, so a read and a write agree.
+
+        Server/DC has no v3 API; callers must branch on ``is_cloud``.
+        """
+        url = self.jira.resource_url(resource, api_version="3")
+        return self.jira.get(url, params=params)
+
+    def _fetch_issue_comments(self, issue_key: str) -> Any:
+        """Fetch an issue's comments, from v3 on Cloud and v2 on Server/DC.
+
+        Read alongside the issue itself over the same API version, so a comment
+        body arrives in the same format as the description rather than one of
+        each.
+
+        Args:
+            issue_key: The issue key (e.g. 'PROJ-123').
+
+        Returns:
+            The parsed JSON body, whose ``comments`` key holds the list.
+        """
+        if not self.config.is_cloud:
+            return self.jira.issue_get_comments(issue_key)
+        return self._get_api3(f"issue/{issue_key}/comment")
 
     def get_paged(
         self,

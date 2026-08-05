@@ -6,6 +6,7 @@ import pytest
 from requests.exceptions import HTTPError
 
 from mcp_atlassian.jira.comments import CommentsMixin
+from tests.utils.mocks import setup_api3_passthrough_mocks
 
 
 class TestCommentsMixin:
@@ -16,6 +17,10 @@ class TestCommentsMixin:
         """Create a CommentsMixin instance with mocked dependencies."""
         mixin = CommentsMixin(config=jira_client.config)
         mixin.jira = jira_client.jira
+
+        # Cloud reads comments over /rest/api/3; route _get_api3 back to the
+        # jira.issue_get_comments mock these tests configure.
+        setup_api3_passthrough_mocks(mixin)
 
         # Set up a mock preprocessor with markdown_to_jira method
         mixin.preprocessor = Mock()
@@ -740,6 +745,10 @@ class TestInternalCommentPublicParam:
         """Create a CommentsMixin instance with mocked dependencies."""
         mixin = CommentsMixin(config=jira_client.config)
         mixin.jira = jira_client.jira
+
+        # Cloud reads comments over /rest/api/3; route _get_api3 back to the
+        # jira.issue_get_comments mock these tests configure.
+        setup_api3_passthrough_mocks(mixin)
         mixin.preprocessor = Mock()
         mixin.preprocessor.markdown_to_jira = Mock(
             return_value="*This* is _Jira_ formatted"
@@ -1043,6 +1052,10 @@ class TestAddEditConversionParity:
     def mixin(self, jira_client):
         mixin = CommentsMixin(config=jira_client.config)
         mixin.jira = jira_client.jira
+
+        # Cloud reads comments over /rest/api/3; route _get_api3 back to the
+        # jira.issue_get_comments mock these tests configure.
+        setup_api3_passthrough_mocks(mixin)
         mixin.preprocessor = Mock()
         mixin.preprocessor.markdown_to_jira = Mock(
             return_value="should-not-be-used-on-cloud"

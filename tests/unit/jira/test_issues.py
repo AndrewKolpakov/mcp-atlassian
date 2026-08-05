@@ -332,7 +332,7 @@ class TestIssuesMixin:
         sent = issues_mixin.jira.create_issue.call_args[1]["fields"]["description"]
         assert isinstance(sent, dict)
         assert sent["version"] == 1
-        issues_mixin.jira.get_issue.assert_called_once_with("TEST-123")
+        assert issues_mixin.jira.get_issue.call_args.args == ("TEST-123",)
 
         # Verify issue
         assert issue.key == "TEST-123"
@@ -801,7 +801,7 @@ class TestIssuesMixin:
             "rest/api/3/issue/TEST-123",
             params={"fields": "description", "updateHistory": "false"},
         )
-        issues_mixin.jira.get_issue.assert_called_once_with("TEST-123", fields=None)
+        assert issues_mixin.jira.get_issue.call_args.args == ("TEST-123",)
         assert document.key == "TEST-123"
 
     def test_update_issue_with_explicit_adf_does_not_fetch_current_description(
@@ -832,7 +832,7 @@ class TestIssuesMixin:
             "issue/TEST-123",
             {"fields": {"description": explicit_adf}},
         )
-        issues_mixin.jira.get_issue.assert_called_once_with("TEST-123", fields=None)
+        assert issues_mixin.jira.get_issue.call_args.args == ("TEST-123",)
 
     def test_update_issue_textarea_custom_field_uses_cloud_v3(
         self, issues_mixin: IssuesMixin, make_issue_data
@@ -1457,7 +1457,7 @@ class TestIssuesMixin:
         assert fields["fixVersions"] == [{"name": "1.0.0"}]
 
         # Verify API call to get issue
-        issues_mixin.jira.get_issue.assert_called_once_with("TEST-123")
+        assert issues_mixin.jira.get_issue.call_args.args == ("TEST-123",)
 
         # Verify result
         assert result.key == "TEST-123"
@@ -1810,7 +1810,7 @@ class TestIssuesMixin:
         issues_mixin.jira.create_issues.return_value = bulk_response
 
         # Mock get_issue responses
-        def get_issue_side_effect(key):
+        def get_issue_side_effect(key, **_kwargs):
             if key == "TEST-1":
                 return {
                     "id": "1",
@@ -3045,6 +3045,10 @@ class TestMoveIssue:
         """IssuesMixin wired to a Cloud instance."""
         mixin = jira_fetcher
         mixin.config.url = "https://test.atlassian.net"
+        # The post-move re-fetch goes over /rest/api/3; route it back to the
+        # jira.get_issue mock so these tests keep describing the move, not the
+        # transport. jira.get stays free for the bulk-task polling below.
+        setup_api3_passthrough_mocks(mixin)
         return mixin
 
     @pytest.fixture
@@ -3262,3 +3266,217 @@ class TestMoveIssue:
 
         assert result.key == "DST-99"
         assert cloud_mixin.jira.get_issue.call_args_list[1].args == ("SRC-1",)
+
+
+class TestIssueReadApiVersion:
+    """The API version a read goes out on, and what that means for its content.
+
+    These tests deliberately do NOT use ``setup_api3_passthrough_mocks``: that
+    helper routes ``_get_api3`` back to the ``jira.get_issue`` mock so the rest
+    of the suite can keep its fixtures, which means it also hides the version.
+    Here the version *is* the subject, so the real ``_get_api3`` runs and the
+    URL it builds is asserted.
+    """
+
+    @staticmethod
+    def _install_url_builder(fetcher: JiraFetcher) -> None:
+        """Make the mocked client build URLs the way the real one does."""
+        fetcher.jira.resource_url = MagicMock(
+            side_effect=lambda resource, api_version=None: (
+                f"rest/api/{api_version or '2'}/{resource}"
+            )
+        )
+
+    @pytest.fixture
+    def cloud_fetcher(self, jira_fetcher: JiraFetcher) -> JiraFetcher:
+        """A Cloud fetcher; its URL is an atlassian.net one."""
+        assert jira_fetcher.config.is_cloud
+        self._install_url_builder(jira_fetcher)
+        return jira_fetcher
+
+    @pytest.fixture
+    def dc_fetcher(self, jira_fetcher: JiraFetcher) -> JiraFetcher:
+        """A Server/DC fetcher, which has no v3 API at all."""
+        jira_fetcher.config.url = "https://jira.example.com"
+        assert not jira_fetcher.config.is_cloud
+        self._install_url_builder(jira_fetcher)
+        return jira_fetcher
+
+    def test_get_issue_reads_v3_on_cloud(
+        self, cloud_fetcher: JiraFetcher, make_issue_data
+    ) -> None:
+        """Cloud reads the issue over /rest/api/3, not the client's v2 default."""
+        cloud_fetcher.jira.get = MagicMock(return_value=make_issue_data())
+
+        cloud_fetcher.get_issue("TEST-123", fields="summary,description")
+
+        cloud_fetcher.jira.resource_url.assert_any_call(
+            "issue/TEST-123", api_version="3"
+        )
+        get_call = next(
+            call
+            for call in cloud_fetcher.jira.get.call_args_list
+            if call.args and call.args[0] == "rest/api/3/issue/TEST-123"
+        )
+        assert get_call.kwargs["params"]["fields"] == "summary,description"
+        assert get_call.kwargs["params"]["updateHistory"] == "true"
+        cloud_fetcher.jira.get_issue.assert_not_called()
+
+    def test_get_issue_reads_v2_on_server_dc(
+        self, dc_fetcher: JiraFetcher, make_issue_data
+    ) -> None:
+        """Server/DC keeps the v2 client call; v3 does not exist there."""
+        dc_fetcher.jira.get_issue = MagicMock(return_value=make_issue_data())
+
+        dc_fetcher.get_issue("TEST-123")
+
+        dc_fetcher.jira.get_issue.assert_called_once()
+        for call in dc_fetcher.jira.resource_url.call_args_list:
+            assert call.kwargs.get("api_version") != "3"
+
+    def test_get_issue_passes_expand_and_properties_to_v3(
+        self, cloud_fetcher: JiraFetcher, make_issue_data
+    ) -> None:
+        """Every parameter the v2 client sent is still sent on v3."""
+        cloud_fetcher.jira.get = MagicMock(return_value=make_issue_data())
+
+        cloud_fetcher.get_issue(
+            "TEST-123",
+            expand="changelog",
+            properties="proforma.forms",
+            update_history=False,
+        )
+
+        params = next(
+            call.kwargs["params"]
+            for call in cloud_fetcher.jira.get.call_args_list
+            if call.args and call.args[0] == "rest/api/3/issue/TEST-123"
+        )
+        assert params["expand"] == "changelog"
+        assert params["properties"] == "proforma.forms"
+        assert params["updateHistory"] == "false"
+
+    def test_comments_are_read_over_v3_on_cloud(
+        self, cloud_fetcher: JiraFetcher
+    ) -> None:
+        """A comment body has to arrive in the same format as the description."""
+        cloud_fetcher.jira.get = MagicMock(return_value={"comments": []})
+
+        cloud_fetcher.get_issue_comments("TEST-123")
+
+        cloud_fetcher.jira.resource_url.assert_any_call(
+            "issue/TEST-123/comment", api_version="3"
+        )
+        cloud_fetcher.jira.issue_get_comments.assert_not_called()
+
+    def test_comments_are_read_over_v2_on_server_dc(
+        self, dc_fetcher: JiraFetcher
+    ) -> None:
+        """Server/DC still uses the client's own comment call."""
+        dc_fetcher.jira.issue_get_comments = MagicMock(return_value={"comments": []})
+
+        dc_fetcher.get_issue_comments("TEST-123")
+
+        dc_fetcher.jira.issue_get_comments.assert_called_once_with("TEST-123")
+
+    def test_adf_description_reaches_the_caller_as_markdown(
+        self, cloud_fetcher: JiraFetcher, make_issue_data
+    ) -> None:
+        """The point of reading v3: structure survives into the Markdown.
+
+        The same panel read through v2 comes back as an anonymous paragraph,
+        because v2 renders the ADF to wiki markup and drops the colour.
+        """
+        issue = make_issue_data()
+        issue["fields"]["description"] = {
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "panel",
+                    "attrs": {"panelType": "warning"},
+                    "content": [
+                        {
+                            "type": "paragraph",
+                            "content": [{"type": "text", "text": "Do not deploy"}],
+                        }
+                    ],
+                },
+                {
+                    "type": "codeBlock",
+                    "attrs": {"language": "python"},
+                    "content": [{"type": "text", "text": "x = 1"}],
+                },
+            ],
+        }
+        cloud_fetcher.jira.get = MagicMock(return_value=issue)
+
+        result = cloud_fetcher.get_issue("TEST-123")
+
+        assert result.description == (
+            ":::warning\nDo not deploy\n:::\n\n```python\nx = 1\n```"
+        )
+
+
+class TestEnvironmentField:
+    """``environment`` is a rich-text field and is read like the description."""
+
+    def test_wiki_environment_is_converted_on_server_dc(
+        self, jira_fetcher: JiraFetcher, make_issue_data
+    ) -> None:
+        """It used to reach the caller as raw wiki markup while the description
+        beside it was converted."""
+        jira_fetcher.config.url = "https://jira.example.com"
+        issue = make_issue_data()
+        issue["fields"]["environment"] = "h3. Staging\n\nRunning *2.1.0*"
+        jira_fetcher.jira.get_issue = MagicMock(return_value=issue)
+
+        result = jira_fetcher.get_issue("TEST-123")
+
+        assert result.environment is not None
+        assert "### Staging" in result.environment
+        assert "**2.1.0**" in result.environment
+        assert "h3." not in result.environment
+
+    def test_adf_environment_is_rendered_as_markdown_on_cloud(
+        self, jira_fetcher: JiraFetcher, make_issue_data
+    ) -> None:
+        """On Cloud the same field arrives as ADF and must not be handed to the
+        wiki preprocessor, which would convert the Markdown a second time."""
+        issue = make_issue_data()
+        issue["fields"]["environment"] = {
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "bulletList",
+                    "content": [
+                        {
+                            "type": "listItem",
+                            "content": [
+                                {
+                                    "type": "paragraph",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "staging",
+                                            "marks": [{"type": "strong"}],
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+        jira_fetcher.jira.resource_url = MagicMock(
+            side_effect=lambda resource, api_version=None: (
+                f"rest/api/{api_version or '2'}/{resource}"
+            )
+        )
+        jira_fetcher.jira.get = MagicMock(return_value=issue)
+
+        result = jira_fetcher.get_issue("TEST-123")
+
+        assert result.environment == "- **staging**"

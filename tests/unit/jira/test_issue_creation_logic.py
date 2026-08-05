@@ -11,6 +11,7 @@ from mcp_atlassian.jira.protocols import (
     ProjectsOperationsProto,
     UsersOperationsProto,
 )
+from tests.utils.mocks import setup_api3_passthrough_mocks
 
 
 class ConcreteIssuesMixin(
@@ -91,6 +92,10 @@ def issues_mixin():
             "fields": {"summary": "Test Summary"},
         }
         mixin.jira.get_issue.return_value = created_issue_response
+
+        # A Cloud re-fetch after the write goes over /rest/api/3; route
+        # _get_api3 back to the jira.get_issue mock above.
+        setup_api3_passthrough_mocks(mixin)
 
         return mixin
 

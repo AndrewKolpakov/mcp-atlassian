@@ -12,6 +12,7 @@ from ..constants import (
     EMPTY_STRING,
     JIRA_DEFAULT_ID,
 )
+from .adf import adf_to_markdown
 from .common import JiraUser
 
 logger = logging.getLogger(__name__)
@@ -76,7 +77,11 @@ class JiraWorklog(ApiModel, TimestampMixin):
         return cls(
             id=worklog_id,
             author=author,
-            comment=data.get("comment"),
+            comment=(
+                adf_to_markdown(raw_comment)
+                if isinstance(raw_comment := data.get("comment"), dict)
+                else raw_comment
+            ),
             created=str(data.get("created", EMPTY_STRING)),
             updated=str(data.get("updated", EMPTY_STRING)),
             started=str(data.get("started", EMPTY_STRING)),

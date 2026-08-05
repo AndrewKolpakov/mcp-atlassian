@@ -5,7 +5,6 @@ import re
 from typing import Any
 
 from ..models import JiraWorklog
-from ..models.jira.adf import adf_to_text
 from ..utils import parse_date
 from .client import JiraClient
 
@@ -143,15 +142,9 @@ class WorklogMixin(JiraClient):
                 raise TypeError(msg)
 
             # Format and return the result
-            comment_raw = result.get("comment", "")
-            comment_text = (
-                adf_to_text(comment_raw)
-                if isinstance(comment_raw, dict)
-                else comment_raw
-            )
             return {
                 "id": result.get("id"),
-                "comment": self._clean_text(comment_text or ""),
+                "comment": self._rich_text_to_markdown(result.get("comment", "")),
                 "created": str(parse_date(result.get("created", ""))),
                 "updated": str(parse_date(result.get("updated", ""))),
                 "started": str(parse_date(result.get("started", ""))),
@@ -218,16 +211,24 @@ class WorklogMixin(JiraClient):
             # `jira.issue_get_worklog()` calls GET /issue/{key}/worklog without
             # pagination parameters, so Jira returns at most 20 entries by default.
             # We paginate explicitly to retrieve all worklogs regardless of count.
-            base_url = self.jira.resource_url("issue")
-            url = f"{base_url}/{issue_key}/worklog"
+            #
+            # Cloud is read over v3, like the issue and its comments: a worklog
+            # comment written by this server is stored as ADF, so reading it
+            # over v2 would hand back Atlassian's wiki rendering of it instead.
+            resource = f"issue/{issue_key}/worklog"
             page_size = 100
             start_at = 0
             worklogs = []
 
             while True:
-                result = self.jira.get(
-                    url, params={"maxResults": page_size, "startAt": start_at}
-                )
+                params = {"maxResults": page_size, "startAt": start_at}
+                if self.config.is_cloud:
+                    result = self._get_api3(resource, params=params)
+                else:
+                    result = self.jira.get(
+                        f"{self.jira.resource_url('issue')}/{issue_key}/worklog",
+                        params=params,
+                    )
                 if not isinstance(result, dict):
                     msg = (
                         f"Unexpected return value type from worklog API: {type(result)}"
@@ -240,7 +241,9 @@ class WorklogMixin(JiraClient):
                     worklogs.append(
                         {
                             "id": worklog.get("id"),
-                            "comment": self._clean_text(worklog.get("comment", "")),
+                            "comment": self._rich_text_to_markdown(
+                                worklog.get("comment", "")
+                            ),
                             "created": str(parse_date(worklog.get("created", ""))),
                             "updated": str(parse_date(worklog.get("updated", ""))),
                             "started": str(parse_date(worklog.get("started", ""))),

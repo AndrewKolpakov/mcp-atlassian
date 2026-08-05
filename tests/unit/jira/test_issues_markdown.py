@@ -6,6 +6,7 @@ import pytest
 
 from mcp_atlassian.jira import JiraFetcher
 from mcp_atlassian.jira.issues import IssuesMixin
+from tests.utils.mocks import setup_api3_passthrough_mocks
 
 
 class TestIssuesMarkdownConversion:
@@ -21,6 +22,10 @@ class TestIssuesMarkdownConversion:
 
         # Add other mock methods
         mixin._get_account_id = MagicMock(return_value="test-account-id")
+
+        # Cloud writes go through _post_api3 and the re-fetch after them
+        # through _get_api3; route both back to the jira.* mocks.
+        setup_api3_passthrough_mocks(mixin)
 
         return mixin
 

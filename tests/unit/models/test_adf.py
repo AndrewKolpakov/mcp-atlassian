@@ -977,17 +977,21 @@ class TestMarkdownToAdf:
         assert bq["type"] == "blockquote"
         assert [n["type"] for n in bq["content"]] == ["paragraph"]
 
-    def test_blockquote_promotes_nothing_but_a_code_fence(self) -> None:
-        """Only paragraph and codeBlock are known-accepted inside a quote.
+    def test_blockquote_promotes_only_what_the_schema_places_there(self) -> None:
+        """A quote promotes a code fence and a list, and nothing else.
 
-        A quoted list or heading therefore stays paragraph text rather than
-        becoming a bulletList or heading node, whose acceptance inside an ADF
-        blockquote has not been measured.
+        ``bulletList``, ``orderedList`` and ``codeBlock`` are declared children
+        of ``blockquote`` in the ADF schema, so a quoted list has to become a
+        real list -- leaving it a paragraph stored ``- item`` as literal text,
+        which is then what a read showed. ``heading`` is not a declared child
+        and stays paragraph text.
         """
         result = markdown_to_adf("> - item\n> ## heading")
         bq = result["content"][0]
-        assert [n["type"] for n in bq["content"]] == ["paragraph", "paragraph"]
-        assert bq["content"][0]["content"][0]["text"] == "- item"
+        assert [n["type"] for n in bq["content"]] == ["bulletList", "paragraph"]
+        item = bq["content"][0]["content"][0]
+        assert item["content"][0]["content"][0]["text"] == "item"
+        assert bq["content"][1]["content"][0]["text"] == "## heading"
 
     # -- Horizontal rule ----------------------------------------------------
 

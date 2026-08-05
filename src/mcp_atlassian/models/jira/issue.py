@@ -16,7 +16,7 @@ from ..constants import (
     JIRA_DEFAULT_ID,
     JIRA_DEFAULT_KEY,
 )
-from .adf import adf_to_text
+from .adf import adf_to_markdown
 from .comment import JiraComment
 from .common import (
     JiraAttachment,
@@ -281,11 +281,13 @@ class JiraIssue(ApiModel, TimestampMixin):
         key = str(data.get("key", JIRA_DEFAULT_KEY))
         summary = str(fields.get("summary", EMPTY_STRING))
 
-        # Handle description - can be string (legacy) or ADF dict (Jira Cloud new editor)
+        # Handle description - an ADF dict on Cloud (which every v3 read
+        # returns), a wiki markup string on Server/DC. The ADF is rendered as
+        # Markdown rather than flattened to text, so structure survives the
+        # read; the string is left to the caller's wiki preprocessor.
         raw_description = fields.get("description")
         if isinstance(raw_description, dict):
-            # Convert ADF to plain text
-            description = adf_to_text(raw_description)
+            description = adf_to_markdown(raw_description)
         else:
             description = raw_description
 
@@ -293,7 +295,7 @@ class JiraIssue(ApiModel, TimestampMixin):
         # classic editor) or an ADF dict (Jira Cloud new editor)
         raw_environment = fields.get("environment")
         if isinstance(raw_environment, dict):
-            environment = adf_to_text(raw_environment)
+            environment = adf_to_markdown(raw_environment)
         else:
             environment = raw_environment
 
@@ -841,6 +843,12 @@ class JiraIssue(ApiModel, TimestampMixin):
         """
         if field_value is None or isinstance(field_value, str | int | float | bool):
             return field_value
+
+        if isinstance(field_value, dict) and field_value.get("type") == "doc":
+            # A text-area custom field comes back as an ADF document on v3.
+            # Without this it would fall through to the reference-object branch
+            # below and be handed to the caller as raw ADF JSON.
+            return adf_to_markdown(field_value)
 
         if isinstance(field_value, dict):
             # For single-select, user pickers, etc., try to extract 'value' or 'name'

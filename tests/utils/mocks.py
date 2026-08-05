@@ -9,11 +9,13 @@ from .factories import AuthConfigFactory, ConfluencePageFactory, JiraIssueFactor
 
 
 def setup_api3_passthrough_mocks(mixin: Any) -> None:
-    """Set up _post_api3/_put_api3 passthrough mocks on a Jira mixin.
+    """Set up _post_api3/_put_api3/_get_api3 passthrough mocks on a Jira mixin.
 
-    Cloud ADF paths delegate to _post_api3/_put_api3. This helper routes
-    those calls back to jira.create_issue / jira.update_issue so existing
-    mocks continue to work.
+    Cloud ADF paths delegate to _post_api3/_put_api3, and Cloud reads to
+    _get_api3. This helper routes those calls back to jira.create_issue /
+    jira.update_issue / jira.get_issue so existing mocks continue to work; the
+    version really used on the wire is pinned by its own tests instead
+    (``test_get_issue_reads_v3_on_cloud`` and friends).
 
     Args:
         mixin: A JiraFetcher or mixin instance with a ``jira`` attribute.
@@ -33,8 +35,23 @@ def setup_api3_passthrough_mocks(mixin: Any) -> None:
             )
         return mixin.jira.put(resource, data=data)
 
+    def _mock_get_api3(resource: str, params: dict | None = None) -> Any:
+        params = params or {}
+        if resource.startswith("issue/") and resource.endswith("/comment"):
+            return mixin.jira.issue_get_comments(resource.split("/")[1])
+        if resource.startswith("issue/"):
+            return mixin.jira.get_issue(
+                resource.split("/", 1)[1],
+                expand=params.get("expand"),
+                fields=params.get("fields"),
+                properties=params.get("properties"),
+                update_history=params.get("updateHistory") == "true",
+            )
+        return mixin.jira.get(resource, params=params)
+
     mixin._post_api3 = Mock(side_effect=_mock_post_api3)
     mixin._put_api3 = Mock(side_effect=_mock_put_api3)
+    mixin._get_api3 = Mock(side_effect=_mock_get_api3)
 
 
 class MockEnvironment:
