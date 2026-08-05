@@ -226,6 +226,73 @@ class TestADFCreateIssue:
         finally:
             await _delete_issue(mcp_client, key)
 
+    async def test_create_issue_tip_panel(
+        self,
+        mcp_client: Client,
+        cloud_instance: CloudInstanceInfo,
+    ) -> None:
+        """:::tip writes a success panel, which Cloud accepts and returns."""
+        key = await _create_issue_with_description(
+            mcp_client,
+            cloud_instance.project_key,
+            ":::tip\nTip body survives Cloud write.\n:::",
+        )
+        try:
+            desc = await _read_issue_description(mcp_client, key)
+            assert "Tip body survives Cloud write." in desc
+        finally:
+            await _delete_issue(mcp_client, key)
+
+    async def test_create_issue_panel_with_quote_is_accepted(
+        self,
+        mcp_client: Client,
+        cloud_instance: CloudInstanceInfo,
+    ) -> None:
+        """A quote inside a panel fence is flattened, so the write is accepted.
+
+        Nesting the blockquote inside the ADF panel instead makes Jira reject
+        the whole request with an opaque 400 INVALID_INPUT that names no field,
+        so the create call below failing is the regression signal.
+        """
+        key = await _create_issue_with_description(
+            mcp_client,
+            cloud_instance.project_key,
+            ":::warning\nPanel intro line.\n> quoted inside panel\n:::",
+        )
+        try:
+            desc = await _read_issue_description(mcp_client, key)
+            assert "Panel intro line." in desc
+            assert "quoted inside panel" in desc
+        finally:
+            await _delete_issue(mcp_client, key)
+
+    async def test_create_issue_expand_fence(
+        self,
+        mcp_client: Client,
+        cloud_instance: CloudInstanceInfo,
+    ) -> None:
+        """The :::expand fence writes an expand node Cloud accepts.
+
+        The readback is v2 wiki markup, in which Jira flattens expand to its
+        title plus inlined content, so only the text can be asserted here.
+        """
+        key = await _create_issue_with_description(
+            mcp_client,
+            cloud_instance.project_key,
+            (
+                ":::expand Deployment details\n"
+                "Expand fence body survives Cloud write.\n"
+                "- first step\n"
+                ":::"
+            ),
+        )
+        try:
+            desc = await _read_issue_description(mcp_client, key)
+            assert "Expand fence body survives Cloud write." in desc
+            assert "first step" in desc
+        finally:
+            await _delete_issue(mcp_client, key)
+
     async def test_create_issue_expand(
         self,
         mcp_client: Client,

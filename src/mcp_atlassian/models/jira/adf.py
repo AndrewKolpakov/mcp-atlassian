@@ -15,6 +15,14 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _MEDIA_NODE_TYPES = frozenset({"media", "mediaSingle", "mediaGroup"})
+_PANEL_TYPES = frozenset({"note", "info", "warning", "success", "error"})
+# ADF has no "tip" panel type; Jira's wiki {tip} is the green one, which ADF
+# spells "success". The read path emits :::success directly, so this alias only
+# has to tolerate hand-authored Markdown.
+_PANEL_TYPE_ALIASES = {"tip": "success"}
+# Measured on Jira Cloud: a panel holding either of these is rejected with an
+# opaque 400 INVALID_INPUT that names no field. See _flatten_panel_content.
+_PANEL_FORBIDDEN_CHILD_TYPES = frozenset({"blockquote", "panel"})
 _TABLE_SEPARATOR_RE = re.compile(r"^:?-+:?$")
 _JIRA_ISSUE_KEY_RE = re.compile(
     r"(?<![A-Za-z0-9_/-])"
@@ -523,7 +531,8 @@ def _build_table_node(
             )
         logger.warning(
             'Converted %d Jira wiki markup table row(s) ("||a||b||") to ADF; '
-            "no other wiki construct is translated%s",
+            "no other wiki construct in a table is translated, cell text is "
+            "parsed as Markdown%s",
             sum(1 for is_wiki, _ in parsed_rows if is_wiki),
             mismatch,
         )
@@ -558,6 +567,128 @@ def _build_table_node(
     }
 
 
+def _collect_fence_lines(lines: list[str], start: int) -> tuple[list[str], int]:
+    """Collect the body of a ``:::`` fence opened on line ``start``.
+
+    An unterminated fence runs to the end of the input, which keeps a truncated
+    document convertible instead of dropping its tail.
+
+    Args:
+        lines: All lines of the document being converted.
+        start: Index of the opening fence line.
+
+    Returns:
+        The body lines (opening and closing fence excluded) and the index of
+        the first line after the fence.
+    """
+    body: list[str] = []
+    index = start + 1
+    while index < len(lines) and lines[index].strip() != ":::":
+        body.append(lines[index])
+        index += 1
+    # Skip the closing :::
+    if index < len(lines):
+        index += 1
+    return body, index
+
+
+def _flatten_panel_content(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Lift blockquote and nested-panel children out of a panel's content.
+
+    Jira rejects an ADF ``panel`` that contains a ``blockquote`` or another
+    ``panel`` with an opaque ``400 INVALID_INPUT`` naming no field (measured on
+    Cloud). A wiki panel *can* hold a quote, so the read path can legitimately
+    hand us ``> `` lines inside a ``:::`` fence -- nesting them would turn a
+    lossy-but-working read into a failed write. The offending wrapper is
+    therefore dropped and its children hoisted into the panel, recursively, so
+    a quote inside a nested panel is flattened too. Inline nodes and their marks
+    are untouched: only the block-level wrapper is lost.
+
+    ``paragraph``, ``heading``, ``bulletList``, ``orderedList`` and
+    ``codeBlock`` are all measured-accepted inside a panel and keep nesting.
+
+    Args:
+        nodes: Nodes parsed from a panel fence body.
+
+    Returns:
+        The same nodes with every forbidden wrapper replaced by its own
+        flattened children.
+    """
+    flattened: list[dict[str, Any]] = []
+    dropped: list[str] = []
+    for node in nodes:
+        node_type = node.get("type")
+        if node_type in _PANEL_FORBIDDEN_CHILD_TYPES:
+            dropped.append(str(node_type))
+            flattened.extend(_flatten_panel_content(node.get("content", [])))
+        else:
+            flattened.append(node)
+
+    if dropped:
+        logger.warning(
+            "Flattened %s inside an ADF panel; Jira rejects a panel containing "
+            "one with 400 INVALID_INPUT, so the wrapper is dropped and its "
+            "content kept",
+            ", ".join(sorted(set(dropped))),
+        )
+
+    return flattened
+
+
+def _wiki_expand_title(raw_title: str) -> str:
+    """Normalize the title of a wiki ``{expand}`` macro.
+
+    Jira spells the title both positionally (``{expand:Foo}``) and as a macro
+    keyword (``{expand:title=Foo}``); both mean the same thing to an author, so
+    the keyword is dropped. Only that one leading prefix is removed, which
+    leaves a positional title containing an ``=`` (``{expand:a=b}``) intact.
+
+    The ``:::expand`` fence deliberately does not go through this: its title is
+    the literal remainder of the fence line, and the read path has already
+    resolved the wiki spelling by the time it emits one.
+
+    Args:
+        raw_title: Text captured after ``{expand:``.
+
+    Returns:
+        The title the author meant, without surrounding whitespace.
+    """
+    return re.sub(r"^\s*title\s*=\s*", "", raw_title, flags=re.IGNORECASE).strip()
+
+
+def _make_expand_node(
+    title: str,
+    body_lines: list[str],
+    jira_base_url: str = "",
+    known_project_keys: set[str] | None = None,
+) -> dict[str, Any]:
+    """Create an ADF expand node from a title and its unparsed body lines.
+
+    Both spellings of an expand block -- the wiki macro
+    ``{expand:Title}...{expand}`` and the ``:::expand Title ... :::`` fence the
+    read path emits -- build their node here, so the two cannot drift. The body
+    is parsed recursively as its own document, exactly as panel content is.
+
+    Args:
+        title: Title attribute; the empty string when the source had none.
+        body_lines: Body lines of the block, without either delimiter.
+        jira_base_url: Jira base URL used to link bare issue keys.
+        known_project_keys: Normalized allowlist of project keys whose issue
+            keys may be linked; None links every issue-key-shaped token.
+
+    Returns:
+        ADF expand node.
+    """
+    inner_doc = markdown_to_adf(
+        "\n".join(body_lines), jira_base_url, known_project_keys
+    )
+    return {
+        "type": "expand",
+        "attrs": {"title": title},
+        "content": inner_doc["content"],
+    }
+
+
 def markdown_to_adf(
     markdown_text: str,
     jira_base_url: str = "",
@@ -566,10 +697,13 @@ def markdown_to_adf(
     """Convert Markdown text to ADF (Atlassian Document Format) document.
 
     Implements a line-by-line parser that handles common Markdown constructs.
-    Jira Cloud expand blocks can be written as
-    ``{expand:Title}...{expand}``. Table rows pasted as Jira wiki markup
-    (``||header||header||``) are recognised alongside Markdown pipe tables.
-    No external dependencies required.
+    ``:::info|note|warning|success|error`` fences become ADF panels, ``:::tip``
+    being an accepted alias for ``success``; a blockquote or panel inside such a
+    fence is flattened, because Jira rejects that nesting (see
+    ``_flatten_panel_content``). Jira Cloud expand blocks can be written as
+    ``:::expand Title ... :::`` or ``{expand:Title}...{expand}``. Table rows
+    pasted as Jira wiki markup (``||header||header||``) are recognised alongside
+    Markdown pipe tables. No external dependencies required.
 
     Args:
         markdown_text: Markdown-formatted text to convert.
@@ -602,7 +736,7 @@ def markdown_to_adf(
         # --- Expand/collapse block ({expand:Title}...{expand}) ---
         expand_match = re.match(r"^\{expand(?::(.+?))?\}\s*$", line)
         if expand_match:
-            expand_title = expand_match.group(1) or ""
+            expand_title = _wiki_expand_title(expand_match.group(1) or "")
             expand_lines: list[str] = []
             i += 1
             while i < len(lines) and not re.match(r"^\{expand\}\s*$", lines[i]):
@@ -611,15 +745,11 @@ def markdown_to_adf(
             # Skip closing {expand}
             if i < len(lines):
                 i += 1
-            # Recursively parse the inner content as ADF
-            inner_markdown = "\n".join(expand_lines)
-            inner_doc = markdown_to_adf(inner_markdown, jira_base_url, project_keys)
-            expand_node: dict[str, Any] = {
-                "type": "expand",
-                "attrs": {"title": expand_title},
-                "content": inner_doc.get("content", []),
-            }
-            doc["content"].append(expand_node)
+            doc["content"].append(
+                _make_expand_node(
+                    expand_title, expand_lines, jira_base_url, project_keys
+                )
+            )
             continue
 
         # --- Fenced code block ---
@@ -707,20 +837,26 @@ def markdown_to_adf(
             )
             continue
 
+        # --- Expand fence (":::expand <title>") ---
+        # Matched before the panel fence: the title is the rest of the fence
+        # line, so it may contain spaces, which the \w+ panel fence cannot.
+        expand_fence_match = re.match(r"^:::expand(?:\s+(.+?))?\s*$", line)
+        if expand_fence_match:
+            fence_title = expand_fence_match.group(1) or ""
+            fence_lines, i = _collect_fence_lines(lines, i)
+            # Unlike a panel, an expand's content is left exactly as parsed.
+            doc["content"].append(
+                _make_expand_node(fence_title, fence_lines, jira_base_url, project_keys)
+            )
+            continue
+
         # --- Panel block ---
         panel_match = re.match(r"^:::(\w+)\s*$", line)
         if panel_match:
-            panel_type = panel_match.group(1).lower()
-            valid_panel_types = {"note", "info", "warning", "success", "error"}
-            if panel_type in valid_panel_types:
-                panel_lines: list[str] = []
-                i += 1
-                while i < len(lines) and lines[i].strip() != ":::":
-                    panel_lines.append(lines[i])
-                    i += 1
-                # Skip closing :::
-                if i < len(lines):
-                    i += 1
+            fence_name = panel_match.group(1).lower()
+            panel_type = _PANEL_TYPE_ALIASES.get(fence_name, fence_name)
+            if panel_type in _PANEL_TYPES:
+                panel_lines, i = _collect_fence_lines(lines, i)
                 # Recursively parse panel content
                 inner_doc = markdown_to_adf(
                     "\n".join(panel_lines), jira_base_url, project_keys
@@ -728,7 +864,7 @@ def markdown_to_adf(
                 panel_node: dict[str, Any] = {
                     "type": "panel",
                     "attrs": {"panelType": panel_type},
-                    "content": inner_doc["content"],
+                    "content": _flatten_panel_content(inner_doc["content"]),
                 }
                 doc["content"].append(panel_node)
                 continue
