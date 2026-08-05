@@ -1339,6 +1339,56 @@ class TestImageProcessing:
         assert "Simple text" in processed_markdown
 
 
+# Issue #1057 residual - the {quote} pattern was greedy, so the first opening
+# tag paired with the last closing one in the field.
+
+
+class TestQuoteBlocks:
+    """Tests for {quote} block conversion.
+
+    Every wiki string here is what Jira Cloud returned from /rest/api/2 for
+    ADF written through /rest/api/3.
+    """
+
+    @pytest.fixture
+    def preprocessor(self):
+        return JiraPreprocessor(base_url="https://example.atlassian.net")
+
+    def test_two_quotes_stay_two_blockquotes(self, preprocessor):
+        """Two blockquote nodes with a paragraph between them.
+
+        A greedy pattern paired the first {quote} with the last closing tag,
+        which quoted the prose between the two blocks and left literal
+        {quote} tokens inside the text.
+        """
+        wiki = (
+            "{quote}first quote{quote}\n\nprose between\n\n{quote}second quote{quote}"
+        )
+        assert preprocessor.jira_to_markdown(wiki) == (
+            "> first quote\n\nprose between\n\n> second quote"
+        )
+
+    def test_three_quotes_stay_three_blockquotes(self, preprocessor):
+        """Pairing is per block, however many blocks the field holds."""
+        wiki = "{quote}a{quote}\nb\n{quote}c{quote}\nd\n{quote}e{quote}"
+        result = preprocessor.jira_to_markdown(wiki)
+        assert "{quote}" not in result
+        assert result == "> a\nb\n> c\nd\n> e"
+
+    def test_quote_drops_jiras_own_surrounding_newlines(self, preprocessor):
+        """The newlines Jira wraps the quoted text in are not quoted lines.
+
+        Keeping them opens and closes the blockquote with an empty "> " line,
+        which a markdown reader shows as a blank quoted paragraph.
+        """
+        assert preprocessor.jira_to_markdown("{quote}\nx\n{quote}") == "> x"
+
+    def test_quote_keeps_interior_blank_line_quoted(self, preprocessor):
+        """An interior blank line keeps "> ", holding one blockquote together."""
+        wiki = "{quote}\nfirst para\n\nsecond para\n{quote}"
+        assert preprocessor.jira_to_markdown(wiki) == "> first para\n> \n> second para"
+
+
 # Issue #1052 - {panel} blocks drop links during wiki-to-markdown conversion
 
 

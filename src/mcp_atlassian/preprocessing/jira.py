@@ -320,6 +320,35 @@ def _wrap_bold_or_italic(match: re.Match[str]) -> str:
     return f"*{match.group(2)}*"
 
 
+# Lazy and per block: with a greedy ``([\s\S]*)`` the first ``{quote}`` pairs
+# with the *last* closing tag in the field, so two quotes with prose between
+# them -- which is exactly what Jira emits for two blockquote nodes -- come back
+# as one blockquote that swallows the prose and carries literal ``{quote}``
+# tokens inside it.  No ``re.MULTILINE``: the pattern has no ``^`` or ``$`` for
+# the flag to change.
+_QUOTE_BLOCK_PATTERN = re.compile(r"\{quote\}([\s\S]*?)\{quote\}")
+
+
+def _convert_quote_block(match: re.Match[str]) -> str:
+    """Convert one ``{quote}`` block to ``> ``-prefixed markdown lines.
+
+    Jira wraps the quoted text in newlines of its own, so exactly one leading
+    and one trailing newline is dropped: keeping them would open and close the
+    blockquote with an empty ``> `` line, which a markdown reader shows as a
+    blank quoted paragraph.  An interior blank line keeps its ``> ``, since
+    that is what holds one blockquote together across two paragraphs.
+
+    Args:
+        match: Match from ``_QUOTE_BLOCK_PATTERN``; group 1 holds the quoted
+            text.
+
+    Returns:
+        The quoted text with every line prefixed by ``"> "``.
+    """
+    content = match.group(1).removeprefix("\n").removesuffix("\n")
+    return "\n".join(f"> {line}" for line in content.split("\n"))
+
+
 def _convert_panel(params: str | None, content: str) -> str:
     """Convert a Jira {panel} block to markdown."""
     title = ""
@@ -614,15 +643,8 @@ class JiraPreprocessor(BasePreprocessor):
         # (-text-) is deliberately left alone, see _INLINE_MARKUP_RULES.
         output = _convert_inline_markup(output)
 
-        # Quote blocks
-        output = re.sub(
-            r"\{quote\}([\s\S]*)\{quote\}",
-            lambda match: "\n".join(
-                [f"> {line}" for line in match.group(1).split("\n")]
-            ),
-            output,
-            flags=re.MULTILINE,
-        )
+        # Quote blocks, one block at a time.  See _QUOTE_BLOCK_PATTERN.
+        output = _QUOTE_BLOCK_PATTERN.sub(_convert_quote_block, output)
 
         # Panel blocks - extract content, optionally show title as bold
         output = re.sub(
