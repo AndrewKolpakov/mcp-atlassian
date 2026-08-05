@@ -226,6 +226,23 @@ class TestADFCreateIssue:
         finally:
             await _delete_issue(mcp_client, key)
 
+    async def test_create_issue_tip_panel(
+        self,
+        mcp_client: Client,
+        cloud_instance: CloudInstanceInfo,
+    ) -> None:
+        """:::tip writes a success panel, which Cloud accepts and returns."""
+        key = await _create_issue_with_description(
+            mcp_client,
+            cloud_instance.project_key,
+            ":::tip\nTip body survives Cloud write.\n:::",
+        )
+        try:
+            desc = await _read_issue_description(mcp_client, key)
+            assert "Tip body survives Cloud write." in desc
+        finally:
+            await _delete_issue(mcp_client, key)
+
     async def test_create_issue_expand(
         self,
         mcp_client: Client,

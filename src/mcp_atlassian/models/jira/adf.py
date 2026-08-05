@@ -15,6 +15,11 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _MEDIA_NODE_TYPES = frozenset({"media", "mediaSingle", "mediaGroup"})
+_PANEL_TYPES = frozenset({"note", "info", "warning", "success", "error"})
+# ADF has no "tip" panel type; Jira's wiki {tip} is the green one, which ADF
+# spells "success". The read path emits :::success directly, so this alias only
+# has to tolerate hand-authored Markdown.
+_PANEL_TYPE_ALIASES = {"tip": "success"}
 _TABLE_SEPARATOR_RE = re.compile(r"^:?-+:?$")
 _JIRA_ISSUE_KEY_RE = re.compile(
     r"(?<![A-Za-z0-9_/-])"
@@ -566,10 +571,11 @@ def markdown_to_adf(
     """Convert Markdown text to ADF (Atlassian Document Format) document.
 
     Implements a line-by-line parser that handles common Markdown constructs.
-    Jira Cloud expand blocks can be written as
-    ``{expand:Title}...{expand}``. Table rows pasted as Jira wiki markup
-    (``||header||header||``) are recognised alongside Markdown pipe tables.
-    No external dependencies required.
+    ``:::info|note|warning|success|error`` fences become ADF panels, ``:::tip``
+    being an accepted alias for ``success``. Jira Cloud expand blocks can be
+    written as ``{expand:Title}...{expand}``. Table rows pasted as Jira wiki
+    markup (``||header||header||``) are recognised alongside Markdown pipe
+    tables. No external dependencies required.
 
     Args:
         markdown_text: Markdown-formatted text to convert.
@@ -710,9 +716,9 @@ def markdown_to_adf(
         # --- Panel block ---
         panel_match = re.match(r"^:::(\w+)\s*$", line)
         if panel_match:
-            panel_type = panel_match.group(1).lower()
-            valid_panel_types = {"note", "info", "warning", "success", "error"}
-            if panel_type in valid_panel_types:
+            fence_name = panel_match.group(1).lower()
+            panel_type = _PANEL_TYPE_ALIASES.get(fence_name, fence_name)
+            if panel_type in _PANEL_TYPES:
                 panel_lines: list[str] = []
                 i += 1
                 while i < len(lines) and lines[i].strip() != ":::":

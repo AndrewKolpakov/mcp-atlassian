@@ -1675,6 +1675,34 @@ class TestMarkdownToAdfPanels:
         types = [n["type"] for n in result["content"]]
         assert types == ["heading", "panel", "bulletList"]
 
+    # -- :::tip alias -------------------------------------------------------
+
+    def test_tip_is_an_alias_for_the_success_panel(self) -> None:
+        """:::tip becomes a success panel; ADF has no "tip" panelType."""
+        result = markdown_to_adf(":::tip\nHandy hint.\n:::")
+        self._assert_valid_adf(result)
+        assert len(result["content"]) == 1
+        panel = result["content"][0]
+        assert panel["type"] == "panel"
+        assert panel["attrs"]["panelType"] == "success"
+        assert panel["content"][0]["type"] == "paragraph"
+
+    def test_tip_fence_is_case_insensitive(self) -> None:
+        """:::TIP resolves through the alias like every other fence name."""
+        result = markdown_to_adf(":::TIP\nHandy hint.\n:::")
+        assert result["content"][0]["attrs"]["panelType"] == "success"
+
+    def test_tip_no_longer_leaks_literal_fence_paragraphs(self) -> None:
+        """Before the alias, :::tip fell through as three literal paragraphs."""
+        result = markdown_to_adf(":::tip\nHandy hint.\n:::")
+        paragraph_texts = [
+            node["content"][0]["text"]
+            for node in result["content"]
+            if node["type"] == "paragraph" and node["content"]
+        ]
+        assert ":::tip" not in paragraph_texts
+        assert ":::" not in paragraph_texts
+
 
 class TestMarkdownToJiraDispatch:
     """Tests for _markdown_to_jira Cloud/Server dispatch."""
