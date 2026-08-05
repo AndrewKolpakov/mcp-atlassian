@@ -531,7 +531,8 @@ def _build_table_node(
             )
         logger.warning(
             'Converted %d Jira wiki markup table row(s) ("||a||b||") to ADF; '
-            "no other wiki construct is translated%s",
+            "no other wiki construct in a table is translated, cell text is "
+            "parsed as Markdown%s",
             sum(1 for is_wiki, _ in parsed_rows if is_wiki),
             mismatch,
         )
