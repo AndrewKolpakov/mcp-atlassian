@@ -1704,6 +1704,73 @@ class TestMarkdownToAdfPanels:
         assert ":::" not in paragraph_texts
 
 
+class TestMarkdownToAdfExpandFence:
+    """Tests for the ``:::expand <title>`` fence in markdown_to_adf."""
+
+    def test_expand_fence_with_title(self) -> None:
+        """The fence line's remainder becomes the expand title."""
+        result = markdown_to_adf(":::expand Deployment details\nbody\n:::")
+        assert len(result["content"]) == 1
+        expand = result["content"][0]
+        assert expand["type"] == "expand"
+        assert expand["attrs"] == {"title": "Deployment details"}
+        assert [n["type"] for n in expand["content"]] == ["paragraph"]
+
+    def test_expand_fence_without_title(self) -> None:
+        """A missing title is the empty string, never None."""
+        result = markdown_to_adf(":::expand\nbody\n:::")
+        expand = result["content"][0]
+        assert expand["type"] == "expand"
+        assert expand["attrs"]["title"] == ""
+
+    def test_expand_fence_title_whitespace_is_trimmed(self) -> None:
+        """Padding around the title is dropped; inner spaces are kept."""
+        result = markdown_to_adf(":::expand   Two  words   \nbody\n:::")
+        assert result["content"][0]["attrs"]["title"] == "Two  words"
+
+    def test_expand_fence_content_is_parsed_recursively(self) -> None:
+        """Fence content is parsed exactly as panel content is."""
+        result = markdown_to_adf(
+            ":::expand Steps\n## Heading\n- item\n```\ncode\n```\n:::"
+        )
+        expand = result["content"][0]
+        assert [n["type"] for n in expand["content"]] == [
+            "heading",
+            "bulletList",
+            "codeBlock",
+        ]
+
+    def test_expand_fence_preserves_surrounding_content(self) -> None:
+        """Content before and after the fence is preserved."""
+        result = markdown_to_adf("Before\n:::expand Title\nInside\n:::\nAfter")
+        types = [n["type"] for n in result["content"]]
+        assert types == ["paragraph", "expand", "paragraph"]
+
+    def test_expand_fence_does_not_flatten_a_blockquote(self) -> None:
+        """The panel nesting guard is deliberately not applied to expand.
+
+        Only ``panel`` was measured against Jira; the ADF schema allows a
+        blockquote inside ``expand``, so it is left nested.
+        """
+        result = markdown_to_adf(":::expand Title\n> quoted line\n:::")
+        expand = result["content"][0]
+        assert expand["type"] == "expand"
+        assert [n["type"] for n in expand["content"]] == ["blockquote"]
+
+    def test_expand_prefixed_word_is_not_an_expand_fence(self) -> None:
+        """:::expanded is not the expand fence and is left to fall through."""
+        result = markdown_to_adf(":::expanded\nbody\n:::")
+        assert not any(n["type"] == "expand" for n in result["content"])
+        assert not any(n["type"] == "panel" for n in result["content"])
+
+    def test_expand_fence_and_panel_fence_coexist(self) -> None:
+        """Both fence spellings can appear in one document."""
+        result = markdown_to_adf(":::expand T\ninside\n:::\n:::tip\nhint\n:::")
+        types = [n["type"] for n in result["content"]]
+        assert types == ["expand", "panel"]
+        assert result["content"][1]["attrs"]["panelType"] == "success"
+
+
 class TestMarkdownToJiraDispatch:
     """Tests for _markdown_to_jira Cloud/Server dispatch."""
 

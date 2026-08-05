@@ -563,6 +563,31 @@ def _build_table_node(
     }
 
 
+def _collect_fence_lines(lines: list[str], start: int) -> tuple[list[str], int]:
+    """Collect the body of a ``:::`` fence opened on line ``start``.
+
+    An unterminated fence runs to the end of the input, which keeps a truncated
+    document convertible instead of dropping its tail.
+
+    Args:
+        lines: All lines of the document being converted.
+        start: Index of the opening fence line.
+
+    Returns:
+        The body lines (opening and closing fence excluded) and the index of
+        the first line after the fence.
+    """
+    body: list[str] = []
+    index = start + 1
+    while index < len(lines) and lines[index].strip() != ":::":
+        body.append(lines[index])
+        index += 1
+    # Skip the closing :::
+    if index < len(lines):
+        index += 1
+    return body, index
+
+
 def markdown_to_adf(
     markdown_text: str,
     jira_base_url: str = "",
@@ -573,9 +598,10 @@ def markdown_to_adf(
     Implements a line-by-line parser that handles common Markdown constructs.
     ``:::info|note|warning|success|error`` fences become ADF panels, ``:::tip``
     being an accepted alias for ``success``. Jira Cloud expand blocks can be
-    written as ``{expand:Title}...{expand}``. Table rows pasted as Jira wiki
-    markup (``||header||header||``) are recognised alongside Markdown pipe
-    tables. No external dependencies required.
+    written as ``:::expand Title ... :::`` or ``{expand:Title}...{expand}``.
+    Table rows pasted as Jira wiki markup (``||header||header||``) are
+    recognised alongside Markdown pipe tables. No external dependencies
+    required.
 
     Args:
         markdown_text: Markdown-formatted text to convert.
@@ -713,20 +739,33 @@ def markdown_to_adf(
             )
             continue
 
+        # --- Expand fence (":::expand <title>") ---
+        # Matched before the panel fence: the title is the rest of the fence
+        # line, so it may contain spaces, which the \w+ panel fence cannot.
+        expand_fence_match = re.match(r"^:::expand(?:\s+(.+?))?\s*$", line)
+        if expand_fence_match:
+            fence_title = expand_fence_match.group(1) or ""
+            fence_lines, i = _collect_fence_lines(lines, i)
+            inner_doc = markdown_to_adf(
+                "\n".join(fence_lines), jira_base_url, project_keys
+            )
+            # Unlike a panel, an expand's content is left exactly as parsed.
+            doc["content"].append(
+                {
+                    "type": "expand",
+                    "attrs": {"title": fence_title},
+                    "content": inner_doc["content"],
+                }
+            )
+            continue
+
         # --- Panel block ---
         panel_match = re.match(r"^:::(\w+)\s*$", line)
         if panel_match:
             fence_name = panel_match.group(1).lower()
             panel_type = _PANEL_TYPE_ALIASES.get(fence_name, fence_name)
             if panel_type in _PANEL_TYPES:
-                panel_lines: list[str] = []
-                i += 1
-                while i < len(lines) and lines[i].strip() != ":::":
-                    panel_lines.append(lines[i])
-                    i += 1
-                # Skip closing :::
-                if i < len(lines):
-                    i += 1
+                panel_lines, i = _collect_fence_lines(lines, i)
                 # Recursively parse panel content
                 inner_doc = markdown_to_adf(
                     "\n".join(panel_lines), jira_base_url, project_keys
