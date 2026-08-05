@@ -381,6 +381,24 @@ def _make_task_item(
     }
 
 
+def _make_code_block(language: str, code_lines: list[str]) -> dict[str, Any]:
+    """Create an ADF codeBlock node from a fence's language and body lines.
+
+    Args:
+        language: Fence info string; an empty string leaves ``attrs`` empty
+            rather than declaring a blank language.
+        code_lines: Body lines, joined verbatim with newlines.
+
+    Returns:
+        ADF codeBlock node.
+    """
+    return {
+        "type": "codeBlock",
+        "attrs": {"language": language} if language else {},
+        "content": [{"type": "text", "text": "\n".join(code_lines)}],
+    }
+
+
 def _split_table_cells(text: str, delimiter: str) -> list[str]:
     """Split a table row on a delimiter, ignoring code spans and link targets.
 
@@ -592,6 +610,75 @@ def _collect_fence_lines(lines: list[str], start: int) -> tuple[list[str], int]:
     return body, index
 
 
+def _collect_code_fence(lines: list[str], start: int) -> tuple[str, list[str], int]:
+    """Collect a ``` fenced code block opened on line ``start``.
+
+    Args:
+        lines: Lines being scanned; already stripped of a ``> `` quote prefix
+            when the fence sits inside a blockquote.
+        start: Index of the opening fence line.
+
+    Returns:
+        The fence's language (empty when unlabelled), its body lines verbatim
+        -- internal indentation and blank lines included -- and the index of
+        the first line after the fence. An unterminated fence runs to the end
+        of the input.
+    """
+    language = lines[start][3:].strip()
+    body: list[str] = []
+    index = start + 1
+    while index < len(lines) and not lines[index].startswith("```"):
+        body.append(lines[index])
+        index += 1
+    # Skip the closing ```
+    if index < len(lines):
+        index += 1
+    return language, body, index
+
+
+def _parse_quoted_block(
+    quote_lines: list[str],
+    jira_base_url: str = "",
+    known_project_keys: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Parse the body of a blockquote, keeping a fenced code block intact.
+
+    Jira renders a wiki ``{quote}`` holding a ``{code}`` block as a fence
+    inside the quote, and an ADF ``blockquote`` containing a ``codeBlock`` is
+    accepted by Cloud (measured), so that fence has to become a real
+    ``codeBlock`` instead of three literal paragraphs. Every other line stays a
+    paragraph: only ``paragraph`` and ``codeBlock`` are known-accepted there, so
+    nothing else is promoted -- this is the opposite of a panel, where a
+    forbidden child is flattened (see ``_flatten_panel_content``).
+
+    A blank line separates paragraphs outside a fence and is literal content
+    inside one.
+
+    Args:
+        quote_lines: Quote body lines with the ``> `` prefix already removed.
+        jira_base_url: Jira base URL used to link bare issue keys.
+        known_project_keys: Normalized allowlist of project keys whose issue
+            keys may be linked; None links every issue-key-shaped token.
+
+    Returns:
+        ADF nodes for the blockquote's content; never empty, because a
+        blockquote with no content is invalid ADF.
+    """
+    content: list[dict[str, Any]] = []
+    index = 0
+    while index < len(quote_lines):
+        line = quote_lines[index]
+        if line.startswith("```"):
+            language, code_lines, index = _collect_code_fence(quote_lines, index)
+            content.append(_make_code_block(language, code_lines))
+            continue
+        if line.strip():
+            content.append(_make_paragraph(line, jira_base_url, known_project_keys))
+        index += 1
+
+    return content or [_make_paragraph("", jira_base_url, known_project_keys)]
+
+
 def _flatten_panel_content(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Lift blockquote and nested-panel children out of a panel's content.
 
@@ -754,21 +841,8 @@ def markdown_to_adf(
 
         # --- Fenced code block ---
         if line.startswith("```"):
-            lang = line[3:].strip()
-            code_lines: list[str] = []
-            i += 1
-            while i < len(lines) and not lines[i].startswith("```"):
-                code_lines.append(lines[i])
-                i += 1
-            # Skip closing ```
-            if i < len(lines):
-                i += 1
-            cb: dict[str, Any] = {
-                "type": "codeBlock",
-                "attrs": {"language": lang} if lang else {},
-                "content": [{"type": "text", "text": "\n".join(code_lines)}],
-            }
-            doc["content"].append(cb)
+            lang, code_lines, i = _collect_code_fence(lines, i)
+            doc["content"].append(_make_code_block(lang, code_lines))
             continue
 
         # --- Horizontal rule ---
@@ -802,12 +876,18 @@ def markdown_to_adf(
         if line.startswith("> "):
             quote_lines: list[str] = []
             while i < len(lines) and lines[i].startswith("> "):
+                # Strip exactly the "> " marker, so indentation inside a quoted
+                # code fence survives.
                 quote_lines.append(lines[i][2:])
                 i += 1
-            bq_content = [
-                _make_paragraph(ln, jira_base_url, project_keys) for ln in quote_lines
-            ]
-            doc["content"].append({"type": "blockquote", "content": bq_content})
+            doc["content"].append(
+                {
+                    "type": "blockquote",
+                    "content": _parse_quoted_block(
+                        quote_lines, jira_base_url, project_keys
+                    ),
+                }
+            )
             continue
 
         # --- Task list (- [ ] / - [x]) ---
