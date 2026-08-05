@@ -972,6 +972,42 @@ class TestMarkdownToAdf:
         types = [n["type"] for n in result["content"]]
         assert types == ["paragraph", "expand", "paragraph"]
 
+    @pytest.mark.parametrize(
+        "opening",
+        [
+            "{expand:More detail}",
+            "{expand:title=More detail}",
+            "{expand:Title=More detail}",
+            "{expand:title = More detail}",
+        ],
+        ids=["positional", "keyword", "keyword-capitalised", "keyword-spaced"],
+    )
+    def test_expand_title_spellings_agree(self, opening: str) -> None:
+        """Jira writes an expand title positionally and as a title= keyword."""
+        result = markdown_to_adf(f"{opening}\nhidden body\n{{expand}}")
+        expand = next(n for n in result["content"] if n["type"] == "expand")
+        assert expand["attrs"]["title"] == "More detail"
+        assert expand["content"][0]["content"][0]["text"] == "hidden body"
+
+    def test_expand_title_padding_is_trimmed(self) -> None:
+        """Whitespace around a macro title is not part of the title."""
+        result = markdown_to_adf("{expand:  More detail  }\nbody\n{expand}")
+        expand = next(n for n in result["content"] if n["type"] == "expand")
+        assert expand["attrs"]["title"] == "More detail"
+
+    def test_expand_title_containing_equals_is_kept(self) -> None:
+        """Only a leading title= is stripped, so 'a=b' stays the title."""
+        result = markdown_to_adf("{expand:a=b}\nbody\n{expand}")
+        expand = next(n for n in result["content"] if n["type"] == "expand")
+        assert expand["attrs"]["title"] == "a=b"
+
+    def test_expand_macro_and_fence_build_the_same_node(self) -> None:
+        """Both spellings share one node builder, so they cannot drift."""
+        from_macro = markdown_to_adf("{expand:T}\nbody\n- item\n{expand}")
+        from_fence = markdown_to_adf(":::expand T\nbody\n- item\n:::")
+        assert from_macro["content"] == from_fence["content"]
+        assert from_macro["content"][0]["type"] == "expand"
+
     # -- Mixed formatting ---------------------------------------------------
 
     def test_mixed_formatting(self):
@@ -1882,6 +1918,16 @@ class TestMarkdownToAdfExpandFence:
         expand = result["content"][0]
         assert expand["type"] == "expand"
         assert [n["type"] for n in expand["content"]] == ["blockquote"]
+
+    def test_expand_fence_keeps_a_literal_title_keyword(self) -> None:
+        """A fence title is literal text, unlike the wiki macro's title=.
+
+        The read path resolves ``{expand:title=T}`` to ``:::expand T`` itself,
+        so a fence still carrying ``title=`` is either hand-authored or a
+        read-path bug; stripping it here would hide the latter.
+        """
+        result = markdown_to_adf(":::expand title=X\nbody\n:::")
+        assert result["content"][0]["attrs"]["title"] == "title=X"
 
     def test_expand_prefixed_word_is_not_an_expand_fence(self) -> None:
         """:::expanded is not the expand fence and is left to fall through."""

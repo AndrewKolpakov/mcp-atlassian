@@ -634,6 +634,60 @@ def _flatten_panel_content(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return flattened
 
 
+def _wiki_expand_title(raw_title: str) -> str:
+    """Normalize the title of a wiki ``{expand}`` macro.
+
+    Jira spells the title both positionally (``{expand:Foo}``) and as a macro
+    keyword (``{expand:title=Foo}``); both mean the same thing to an author, so
+    the keyword is dropped. Only that one leading prefix is removed, which
+    leaves a positional title containing an ``=`` (``{expand:a=b}``) intact.
+
+    The ``:::expand`` fence deliberately does not go through this: its title is
+    the literal remainder of the fence line, and the read path has already
+    resolved the wiki spelling by the time it emits one.
+
+    Args:
+        raw_title: Text captured after ``{expand:``.
+
+    Returns:
+        The title the author meant, without surrounding whitespace.
+    """
+    return re.sub(r"^\s*title\s*=\s*", "", raw_title, flags=re.IGNORECASE).strip()
+
+
+def _make_expand_node(
+    title: str,
+    body_lines: list[str],
+    jira_base_url: str = "",
+    known_project_keys: set[str] | None = None,
+) -> dict[str, Any]:
+    """Create an ADF expand node from a title and its unparsed body lines.
+
+    Both spellings of an expand block -- the wiki macro
+    ``{expand:Title}...{expand}`` and the ``:::expand Title ... :::`` fence the
+    read path emits -- build their node here, so the two cannot drift. The body
+    is parsed recursively as its own document, exactly as panel content is.
+
+    Args:
+        title: Title attribute; the empty string when the source had none.
+        body_lines: Body lines of the block, without either delimiter.
+        jira_base_url: Jira base URL used to link bare issue keys.
+        known_project_keys: Normalized allowlist of project keys whose issue
+            keys may be linked; None links every issue-key-shaped token.
+
+    Returns:
+        ADF expand node.
+    """
+    inner_doc = markdown_to_adf(
+        "\n".join(body_lines), jira_base_url, known_project_keys
+    )
+    return {
+        "type": "expand",
+        "attrs": {"title": title},
+        "content": inner_doc["content"],
+    }
+
+
 def markdown_to_adf(
     markdown_text: str,
     jira_base_url: str = "",
@@ -681,7 +735,7 @@ def markdown_to_adf(
         # --- Expand/collapse block ({expand:Title}...{expand}) ---
         expand_match = re.match(r"^\{expand(?::(.+?))?\}\s*$", line)
         if expand_match:
-            expand_title = expand_match.group(1) or ""
+            expand_title = _wiki_expand_title(expand_match.group(1) or "")
             expand_lines: list[str] = []
             i += 1
             while i < len(lines) and not re.match(r"^\{expand\}\s*$", lines[i]):
@@ -690,15 +744,11 @@ def markdown_to_adf(
             # Skip closing {expand}
             if i < len(lines):
                 i += 1
-            # Recursively parse the inner content as ADF
-            inner_markdown = "\n".join(expand_lines)
-            inner_doc = markdown_to_adf(inner_markdown, jira_base_url, project_keys)
-            expand_node: dict[str, Any] = {
-                "type": "expand",
-                "attrs": {"title": expand_title},
-                "content": inner_doc.get("content", []),
-            }
-            doc["content"].append(expand_node)
+            doc["content"].append(
+                _make_expand_node(
+                    expand_title, expand_lines, jira_base_url, project_keys
+                )
+            )
             continue
 
         # --- Fenced code block ---
@@ -793,16 +843,9 @@ def markdown_to_adf(
         if expand_fence_match:
             fence_title = expand_fence_match.group(1) or ""
             fence_lines, i = _collect_fence_lines(lines, i)
-            inner_doc = markdown_to_adf(
-                "\n".join(fence_lines), jira_base_url, project_keys
-            )
             # Unlike a panel, an expand's content is left exactly as parsed.
             doc["content"].append(
-                {
-                    "type": "expand",
-                    "attrs": {"title": fence_title},
-                    "content": inner_doc["content"],
-                }
+                _make_expand_node(fence_title, fence_lines, jira_base_url, project_keys)
             )
             continue
 
