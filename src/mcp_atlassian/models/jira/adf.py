@@ -20,6 +20,9 @@ _PANEL_TYPES = frozenset({"note", "info", "warning", "success", "error"})
 # spells "success". The read path emits :::success directly, so this alias only
 # has to tolerate hand-authored Markdown.
 _PANEL_TYPE_ALIASES = {"tip": "success"}
+# Measured on Jira Cloud: a panel holding either of these is rejected with an
+# opaque 400 INVALID_INPUT that names no field. See _flatten_panel_content.
+_PANEL_FORBIDDEN_CHILD_TYPES = frozenset({"blockquote", "panel"})
 _TABLE_SEPARATOR_RE = re.compile(r"^:?-+:?$")
 _JIRA_ISSUE_KEY_RE = re.compile(
     r"(?<![A-Za-z0-9_/-])"
@@ -588,6 +591,49 @@ def _collect_fence_lines(lines: list[str], start: int) -> tuple[list[str], int]:
     return body, index
 
 
+def _flatten_panel_content(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Lift blockquote and nested-panel children out of a panel's content.
+
+    Jira rejects an ADF ``panel`` that contains a ``blockquote`` or another
+    ``panel`` with an opaque ``400 INVALID_INPUT`` naming no field (measured on
+    Cloud). A wiki panel *can* hold a quote, so the read path can legitimately
+    hand us ``> `` lines inside a ``:::`` fence -- nesting them would turn a
+    lossy-but-working read into a failed write. The offending wrapper is
+    therefore dropped and its children hoisted into the panel, recursively, so
+    a quote inside a nested panel is flattened too. Inline nodes and their marks
+    are untouched: only the block-level wrapper is lost.
+
+    ``paragraph``, ``heading``, ``bulletList``, ``orderedList`` and
+    ``codeBlock`` are all measured-accepted inside a panel and keep nesting.
+
+    Args:
+        nodes: Nodes parsed from a panel fence body.
+
+    Returns:
+        The same nodes with every forbidden wrapper replaced by its own
+        flattened children.
+    """
+    flattened: list[dict[str, Any]] = []
+    dropped: list[str] = []
+    for node in nodes:
+        node_type = node.get("type")
+        if node_type in _PANEL_FORBIDDEN_CHILD_TYPES:
+            dropped.append(str(node_type))
+            flattened.extend(_flatten_panel_content(node.get("content", [])))
+        else:
+            flattened.append(node)
+
+    if dropped:
+        logger.warning(
+            "Flattened %s inside an ADF panel; Jira rejects a panel containing "
+            "one with 400 INVALID_INPUT, so the wrapper is dropped and its "
+            "content kept",
+            ", ".join(sorted(set(dropped))),
+        )
+
+    return flattened
+
+
 def markdown_to_adf(
     markdown_text: str,
     jira_base_url: str = "",
@@ -597,11 +643,12 @@ def markdown_to_adf(
 
     Implements a line-by-line parser that handles common Markdown constructs.
     ``:::info|note|warning|success|error`` fences become ADF panels, ``:::tip``
-    being an accepted alias for ``success``. Jira Cloud expand blocks can be
-    written as ``:::expand Title ... :::`` or ``{expand:Title}...{expand}``.
-    Table rows pasted as Jira wiki markup (``||header||header||``) are
-    recognised alongside Markdown pipe tables. No external dependencies
-    required.
+    being an accepted alias for ``success``; a blockquote or panel inside such a
+    fence is flattened, because Jira rejects that nesting (see
+    ``_flatten_panel_content``). Jira Cloud expand blocks can be written as
+    ``:::expand Title ... :::`` or ``{expand:Title}...{expand}``. Table rows
+    pasted as Jira wiki markup (``||header||header||``) are recognised alongside
+    Markdown pipe tables. No external dependencies required.
 
     Args:
         markdown_text: Markdown-formatted text to convert.
@@ -773,7 +820,7 @@ def markdown_to_adf(
                 panel_node: dict[str, Any] = {
                     "type": "panel",
                     "attrs": {"panelType": panel_type},
-                    "content": inner_doc["content"],
+                    "content": _flatten_panel_content(inner_doc["content"]),
                 }
                 doc["content"].append(panel_node)
                 continue

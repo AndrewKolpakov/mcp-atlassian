@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.mcp_atlassian.models.jira.adf import (
+    _flatten_panel_content,
     adf_to_text,
     extract_top_level_media_nodes,
     markdown_to_adf,
@@ -1702,6 +1703,131 @@ class TestMarkdownToAdfPanels:
         ]
         assert ":::tip" not in paragraph_texts
         assert ":::" not in paragraph_texts
+
+    # -- Panel nesting guard ------------------------------------------------
+
+    def test_blockquote_in_panel_is_flattened_not_nested(self) -> None:
+        """A quote inside a panel is hoisted into paragraphs.
+
+        Measured on Jira Cloud: an ADF panel containing a blockquote is
+        rejected with an opaque 400 INVALID_INPUT that names no field. Wiki
+        panels may hold quotes, so the read path can produce this input; the
+        flattening keeps the write working at the cost of the quote wrapper.
+        """
+        result = markdown_to_adf(":::warning\nbefore\n> quoted line\nafter\n:::")
+        panel = result["content"][0]
+        assert panel["type"] == "panel"
+        inner_types = [n["type"] for n in panel["content"]]
+        assert "blockquote" not in inner_types
+        assert inner_types == ["paragraph", "paragraph", "paragraph"]
+        assert panel["content"][1]["content"][0]["text"] == "quoted line"
+
+    def test_nested_panel_is_flattened_not_nested(self) -> None:
+        """A panel inside a panel is hoisted into its parent's content.
+
+        Measured on Jira Cloud: an ADF panel containing another panel is
+        rejected with the same opaque 400 INVALID_INPUT.
+        """
+        result = markdown_to_adf(":::info\nouter\n:::note\ninner\n:::")
+        panel = result["content"][0]
+        assert panel["type"] == "panel"
+        assert panel["attrs"]["panelType"] == "info"
+        inner_types = [n["type"] for n in panel["content"]]
+        assert "panel" not in inner_types
+        assert inner_types == ["paragraph", "paragraph"]
+        assert panel["content"][1]["content"][0]["text"] == "inner"
+
+    def test_flattening_recurses_into_a_forbidden_wrapper(self) -> None:
+        """No forbidden wrapper survives, however deeply it is nested.
+
+        The Markdown parser cannot currently build a quote inside a panel
+        inside a panel -- each fence flattens its own body -- so the guard is
+        exercised directly rather than depending on that being true forever.
+        """
+        nested = [
+            {"type": "paragraph", "content": [{"type": "text", "text": "outer"}]},
+            {
+                "type": "panel",
+                "attrs": {"panelType": "note"},
+                "content": [
+                    {
+                        "type": "blockquote",
+                        "content": [
+                            {
+                                "type": "paragraph",
+                                "content": [{"type": "text", "text": "deep"}],
+                            }
+                        ],
+                    }
+                ],
+            },
+        ]
+        flattened = _flatten_panel_content(nested)
+        assert [n["type"] for n in flattened] == ["paragraph", "paragraph"]
+        assert flattened[1]["content"][0]["text"] == "deep"
+
+    def test_flattened_quote_keeps_its_inline_marks(self) -> None:
+        """Only the block wrapper is dropped; inline marks are untouched."""
+        result = markdown_to_adf(":::error\n> **bold** quote\n:::")
+        paragraph = result["content"][0]["content"][0]
+        assert paragraph["type"] == "paragraph"
+        bold = next(
+            node
+            for node in paragraph["content"]
+            if any(mark["type"] == "strong" for mark in node.get("marks", []))
+        )
+        assert bold["text"] == "bold"
+
+    def test_flattening_warns_naming_the_dropped_wrapper(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The lossy rewrite is logged, not silent."""
+        with caplog.at_level(logging.WARNING):
+            markdown_to_adf(":::warning\n> quoted line\n:::")
+
+        messages = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name.endswith("models.jira.adf") and r.levelno == logging.WARNING
+        ]
+        assert len(messages) == 1
+        assert messages[0].startswith("Flattened blockquote inside an ADF panel")
+        assert "INVALID_INPUT" in messages[0]
+
+    def test_panel_without_forbidden_children_logs_nothing(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A well-formed panel converts silently."""
+        with caplog.at_level(logging.WARNING):
+            markdown_to_adf(":::info\nbody\n- item\n:::")
+
+        assert [r for r in caplog.records if r.name.endswith("models.jira.adf")] == []
+
+    @pytest.mark.parametrize(
+        ("markdown", "expected_type"),
+        [
+            ("body", "paragraph"),
+            ("### Inner heading", "heading"),
+            ("- item", "bulletList"),
+            ("1. item", "orderedList"),
+            ("```python\ny = 2\n```", "codeBlock"),
+        ],
+        ids=["paragraph", "heading", "bulletList", "orderedList", "codeBlock"],
+    )
+    def test_panel_keeps_accepted_children_nested(
+        self, markdown: str, expected_type: str
+    ) -> None:
+        """Every measured-accepted child type still nests inside the panel."""
+        result = markdown_to_adf(f":::info\n{markdown}\n:::")
+        panel = result["content"][0]
+        assert panel["type"] == "panel"
+        assert [n["type"] for n in panel["content"]] == [expected_type]
+
+    def test_blockquote_outside_a_panel_still_nests(self) -> None:
+        """The guard is scoped to panels: a top-level quote is unaffected."""
+        result = markdown_to_adf("> quoted line")
+        assert result["content"][0]["type"] == "blockquote"
+        assert result["content"][0]["content"][0]["type"] == "paragraph"
 
 
 class TestMarkdownToAdfExpandFence:

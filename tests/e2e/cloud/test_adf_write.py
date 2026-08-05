@@ -243,6 +243,29 @@ class TestADFCreateIssue:
         finally:
             await _delete_issue(mcp_client, key)
 
+    async def test_create_issue_panel_with_quote_is_accepted(
+        self,
+        mcp_client: Client,
+        cloud_instance: CloudInstanceInfo,
+    ) -> None:
+        """A quote inside a panel fence is flattened, so the write is accepted.
+
+        Nesting the blockquote inside the ADF panel instead makes Jira reject
+        the whole request with an opaque 400 INVALID_INPUT that names no field,
+        so the create call below failing is the regression signal.
+        """
+        key = await _create_issue_with_description(
+            mcp_client,
+            cloud_instance.project_key,
+            ":::warning\nPanel intro line.\n> quoted inside panel\n:::",
+        )
+        try:
+            desc = await _read_issue_description(mcp_client, key)
+            assert "Panel intro line." in desc
+            assert "quoted inside panel" in desc
+        finally:
+            await _delete_issue(mcp_client, key)
+
     async def test_create_issue_expand_fence(
         self,
         mcp_client: Client,
