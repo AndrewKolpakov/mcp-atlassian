@@ -927,6 +927,68 @@ class TestMarkdownToAdf:
         bq = next(n for n in result["content"] if n["type"] == "blockquote")
         assert bq["content"][0]["type"] == "paragraph"
 
+    def test_blockquote_with_fenced_code_block(self) -> None:
+        """A fence inside a quote is a codeBlock, not three paragraphs.
+
+        This is the exact Markdown the read path produces for Jira's own
+        ``{quote}q with code\\n\\n{code:python}x = 1{code}{quote}``, and an ADF
+        blockquote containing a codeBlock is accepted by Cloud (measured), so
+        the fence must not leak as literal text.
+        """
+        md = "> q with code\n> \n> ```python\n> x = 1\n> ```"
+        result = markdown_to_adf(md)
+        assert [n["type"] for n in result["content"]] == ["blockquote"]
+        bq = result["content"][0]
+        assert [n["type"] for n in bq["content"]] == ["paragraph", "codeBlock"]
+        assert bq["content"][0]["content"][0]["text"] == "q with code"
+        code = bq["content"][1]
+        assert code["attrs"] == {"language": "python"}
+        assert code["content"] == [{"type": "text", "text": "x = 1"}]
+
+    def test_blockquote_code_fence_keeps_indentation(self) -> None:
+        """Only the "> " marker is stripped, so code indentation survives."""
+        md = "> ```python\n> if x:\n>     pass\n> ```"
+        result = markdown_to_adf(md)
+        code = result["content"][0]["content"][0]
+        assert code["type"] == "codeBlock"
+        assert code["content"][0]["text"] == "if x:\n    pass"
+
+    def test_blockquote_code_fence_keeps_blank_lines(self) -> None:
+        """A blank quoted line is literal content inside a fence."""
+        md = "> ```\n> a\n> \n> b\n> ```"
+        result = markdown_to_adf(md)
+        code = result["content"][0]["content"][0]
+        assert code["type"] == "codeBlock"
+        assert code["attrs"] == {}
+        assert code["content"][0]["text"] == "a\n\nb"
+
+    def test_blockquote_blank_line_outside_a_fence_is_a_break(self) -> None:
+        """Outside a fence a blank quoted line separates paragraphs."""
+        md = "> first\n> \n> second"
+        result = markdown_to_adf(md)
+        bq = result["content"][0]
+        assert [n["type"] for n in bq["content"]] == ["paragraph", "paragraph"]
+        assert bq["content"][1]["content"][0]["text"] == "second"
+
+    def test_blockquote_of_only_blank_lines_keeps_one_paragraph(self) -> None:
+        """A blockquote with no content at all is invalid ADF."""
+        result = markdown_to_adf("> ")
+        bq = result["content"][0]
+        assert bq["type"] == "blockquote"
+        assert [n["type"] for n in bq["content"]] == ["paragraph"]
+
+    def test_blockquote_promotes_nothing_but_a_code_fence(self) -> None:
+        """Only paragraph and codeBlock are known-accepted inside a quote.
+
+        A quoted list or heading therefore stays paragraph text rather than
+        becoming a bulletList or heading node, whose acceptance inside an ADF
+        blockquote has not been measured.
+        """
+        result = markdown_to_adf("> - item\n> ## heading")
+        bq = result["content"][0]
+        assert [n["type"] for n in bq["content"]] == ["paragraph", "paragraph"]
+        assert bq["content"][0]["content"][0]["text"] == "- item"
+
     # -- Horizontal rule ----------------------------------------------------
 
     @pytest.mark.parametrize(
