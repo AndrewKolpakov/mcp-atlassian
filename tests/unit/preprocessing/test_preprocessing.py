@@ -1651,6 +1651,135 @@ class TestBlockMacros:
         assert result == ":::info\na{note}b\n:::"
 
 
+# The write direction of the same fences, for Server/DC.  Without it a
+# description read and written back puts the fence into the field as literal
+# text.
+
+
+class TestFencedBlocksToWiki:
+    """Tests for ::: fence conversion in markdown_to_jira."""
+
+    @pytest.fixture
+    def preprocessor(self):
+        return JiraPreprocessor(base_url="https://example.atlassian.net")
+
+    @pytest.mark.parametrize(
+        "markdown, expected",
+        [
+            pytest.param(
+                ":::info\nbody\n:::",
+                "{panel:bgColor=#deebff}\nbody\n{panel}",
+                id="info",
+            ),
+            pytest.param(
+                ":::note\nbody\n:::",
+                "{panel:bgColor=#eae6ff}\nbody\n{panel}",
+                id="note",
+            ),
+            pytest.param(
+                ":::warning\nbody\n:::",
+                "{panel:bgColor=#fffae6}\nbody\n{panel}",
+                id="warning",
+            ),
+            pytest.param(
+                ":::success\nbody\n:::",
+                "{panel:bgColor=#e3fcef}\nbody\n{panel}",
+                id="success",
+            ),
+            pytest.param(
+                ":::error\nbody\n:::",
+                "{panel:bgColor=#ffebe6}\nbody\n{panel}",
+                id="error",
+            ),
+            pytest.param(
+                ":::tip\nbody\n:::",
+                "{panel:bgColor=#e3fcef}\nbody\n{panel}",
+                id="tip-is-an-alias-for-success",
+            ),
+            pytest.param(
+                ":::INFO\nbody\n:::",
+                "{panel:bgColor=#deebff}\nbody\n{panel}",
+                id="kind-is-case-insensitive",
+            ),
+            pytest.param(
+                ":::expand Details\nbody\n:::",
+                "{expand:title=Details}\nbody\n{expand}",
+                id="expand-with-a-title",
+            ),
+            pytest.param(
+                ":::expand\nbody\n:::",
+                "{expand}\nbody\n{expand}",
+                id="expand-without-a-title",
+            ),
+            pytest.param(
+                ":::info\n**Titled**\n\nafter title\n:::",
+                "{panel:bgColor=#deebff}\n*Titled*\n\nafter title\n{panel}",
+                id="fence-content-is-converted-as-normal-markdown",
+            ),
+            pytest.param(
+                ":::note\n- one\n- two\n:::",
+                "{panel:bgColor=#eae6ff}\n* one\n* two\n{panel}",
+                id="list-inside-a-fence",
+            ),
+            pytest.param(
+                ":::expand My **bold** title\nbody\n:::",
+                "{expand:title=My *bold* title}\nbody\n{expand}",
+                id="markup-in-an-expand-title",
+            ),
+        ],
+    )
+    def test_fence_converts_to_wiki_macro(
+        self, preprocessor, markdown: str, expected: str
+    ):
+        """A fence becomes the wiki macro Jira renders, colour and all."""
+        assert preprocessor.markdown_to_jira(markdown) == expected
+
+    def test_nested_fences_close_innermost_first(self, preprocessor):
+        """The fences pair by nesting; the closers are not interchangeable.
+
+        The inner fence is an expand and the outer a panel on purpose: with two
+        panels both closing tags read {panel}, so closing the wrong one is
+        invisible.
+        """
+        markdown = ":::info\nouter\n\n:::expand Details\ninner\n:::\n\n:::"
+        assert preprocessor.markdown_to_jira(markdown) == (
+            "{panel:bgColor=#deebff}\nouter\n\n"
+            "{expand:title=Details}\ninner\n{expand}\n\n{panel}"
+        )
+
+    @pytest.mark.parametrize(
+        "markdown",
+        [
+            pytest.param("::: see below\nbody", id="prose-opening-with-colons"),
+            pytest.param(":::foo\nbody\n:::", id="unknown-kind"),
+            pytest.param(
+                ":::info Extra\nbody\n:::",
+                id="panel-fence-carries-no-trailing-text",
+            ),
+            pytest.param(":::info\nnever closed", id="opener-never-closed"),
+            pytest.param("prose\n\n:::\n\nmore prose", id="closer-with-nothing-open"),
+            pytest.param("a ::: in the middle of a line", id="colons-mid-line"),
+        ],
+    )
+    def test_not_a_fence_stays_literal(self, preprocessor, markdown: str):
+        """Only the fence form the read path emits is rewritten."""
+        assert preprocessor.markdown_to_jira(markdown) == markdown
+
+    def test_fence_inside_a_code_block_stays_literal(self, preprocessor):
+        """Code content is protected from this pass, as in the read direction."""
+        result = preprocessor.markdown_to_jira("```\n:::info\nfenced\n:::\n```")
+        assert "{panel" not in result
+        assert ":::info" in result
+        assert result.startswith("{code}")
+        assert result.endswith("{code}")
+
+    def test_fence_inside_inline_code_stays_literal(self, preprocessor):
+        """An inline code span is extracted too, so it cannot open a fence."""
+        assert preprocessor.markdown_to_jira("`:::info` is a fence") == (
+            "{{:::info}} is a fence"
+        )
+
+
 # Code block placeholder protection tests
 
 

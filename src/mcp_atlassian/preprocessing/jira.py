@@ -373,6 +373,24 @@ _QUOTED_CODEBLOCK_PATTERN = re.compile(
     r"^((?:> )+)(?=\x00CODEBLOCK(\d+)\x00)", re.MULTILINE
 )
 
+# The write direction of the fences above, for Server/DC -- Cloud writes ADF.
+# Without it a description read and written back on Server puts the fence into
+# the field as literal text, where before the read path spelled panels this way
+# it at least came back as prose that renders.  The colours are the read map
+# inverted, so the two directions cannot drift apart.
+_PANEL_TYPE_BG_COLORS = {
+    panel_type: bg_color for bg_color, panel_type in _PANEL_BG_COLOR_TYPES.items()
+}
+# ``:::tip`` is accepted on the write side only, as an alias for success, so
+# hand-authored markdown is tolerated; the read path never emits it.
+_FENCE_PANEL_ALIASES = {"tip": "success"}
+# The fence form the read path emits, and nothing looser.  A whole line, so
+# prose that merely opens with three colons is left alone; the kind is optional
+# so one pattern also matches the closing fence.  Trailing text is captured
+# rather than allowed, because a panel fence carries none -- that is what
+# ``markdown_to_adf`` accepts too, and it keeps ``::: see below`` prose.
+_MD_FENCE_PATTERN = re.compile(r"^:::(?:([A-Za-z]+)(?:[ \t]+(.*?))?)?[ \t]*$")
+
 
 def _convert_quote_block(match: re.Match[str]) -> str:
     """Convert one ``{quote}`` block to ``> ``-prefixed markdown lines.
@@ -591,6 +609,70 @@ def _carry_quote_prefix_into_code_blocks(text: str, code_blocks: list[str]) -> N
         # (see _NUL_PLACEHOLDER), so the index is not trusted to be one of ours.
         if index < len(code_blocks):
             code_blocks[index] = code_blocks[index].replace("\n", f"\n{match.group(1)}")
+
+
+def _fence_macros(kind: str, title: str | None) -> tuple[str, str] | None:
+    """Build the wiki opening and closing tags for one ``:::`` fence.
+
+    Args:
+        kind: Lower-cased word after the colons, e.g. ``"warning"``.
+        title: Text following the kind on the fence line, or None when there is
+            none.
+
+    Returns:
+        The opening and closing tag, or None when the line is not a fence this
+        writes: an unknown kind, or a panel kind carrying trailing text.
+    """
+    if kind == "expand":
+        return (f"{{expand:title={title}}}" if title else "{expand}"), "{expand}"
+    if title is not None:
+        return None
+    bg_color = _PANEL_TYPE_BG_COLORS.get(_FENCE_PANEL_ALIASES.get(kind, kind))
+    if bg_color is None:
+        return None
+    return f"{{panel:bgColor={bg_color}}}", "{panel}"
+
+
+def _convert_fenced_blocks(text: str) -> str:
+    """Convert ``:::`` panel and expand fences to the wiki macros they came from.
+
+    The opening and closing fences are different tokens, so unlike the wiki
+    macros they pair by nesting with no ambiguity: a closing fence closes the
+    innermost fence still open.  A fence left unclosed is written out verbatim
+    rather than as a macro, since half a macro reads worse in the field than the
+    fence a human wrote.
+
+    Args:
+        text: Text in markdown, with code blocks already extracted -- a fence
+            inside a code block must stay literal, and extraction is what keeps
+            it out of reach here.
+
+    Returns:
+        Text with every paired fence replaced by its wiki tag.
+    """
+    if ":::" not in text:
+        return text
+    lines = text.split("\n")
+    macros: dict[int, str] = {}
+    open_stack: list[tuple[int, str, str]] = []
+    for index, line in enumerate(lines):
+        match = _MD_FENCE_PATTERN.match(line)
+        if match is None:
+            continue
+        kind = match.group(1)
+        if kind is None:
+            # A closing fence with nothing open is prose, not a fence.
+            if open_stack:
+                open_index, open_tag, close_tag = open_stack.pop()
+                macros[open_index] = open_tag
+                macros[index] = close_tag
+            continue
+        tags = _fence_macros(kind.lower(), match.group(2))
+        if tags is not None:
+            open_stack.append((index, tags[0], tags[1]))
+    for index, macro in macros.items():
+        lines[index] = macro
+    return "\n".join(lines)
 
 
 class JiraPreprocessor(BasePreprocessor):
@@ -1013,6 +1095,12 @@ class JiraPreprocessor(BasePreprocessor):
             inline_codes,
             "INLINECODE",
         )
+
+        # Panel and expand fences, back to their wiki macros.  After the code
+        # extraction, so a fence inside a code block stays literal, and before
+        # every other pass, so a fence's content is converted like any other
+        # markdown.
+        output = _convert_fenced_blocks(output)
 
         # Headers with = or - underlines
         output = re.sub(

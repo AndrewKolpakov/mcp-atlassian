@@ -254,6 +254,76 @@ See [PROJ-123|https://example.atlassian.net/browse/PROJ-123|smart-link] for deta
         """
         assert jira_preprocessor.clean_jira_text(jira_markup) == expected
 
+    @pytest.mark.parametrize(
+        "jira_markup",
+        [
+            pytest.param("{panel:bgColor=#deebff}\ninfo body\n{panel}", id="info"),
+            pytest.param("{panel:bgColor=#eae6ff}\nnote body\n{panel}", id="note"),
+            pytest.param("{panel:bgColor=#fffae6}\nwarn body\n{panel}", id="warning"),
+            pytest.param("{panel:bgColor=#e3fcef}\nok body\n{panel}", id="success"),
+            pytest.param("{panel:bgColor=#ffebe6}\nerr body\n{panel}", id="error"),
+            pytest.param(
+                "{panel:bgColor=#deebff}\n*Titled*\n\nafter title\n{panel}",
+                id="titled-panel",
+            ),
+            pytest.param("{panel:bgColor=#eae6ff}\n* item\n{panel}", id="panel-list"),
+        ],
+    )
+    def test_jira_panel_survives_a_server_round_trip_unchanged(
+        self, jira_preprocessor, jira_markup: str
+    ):
+        """A Cloud-shaped panel read and written back on Server is byte-identical.
+
+        The wiki strings are what Jira Cloud returned for an ADF panel, so this
+        pins both directions against one measured spelling: read them to a ``:::``
+        fence, write them back, and the field is unchanged.
+        """
+        markdown = jira_preprocessor.jira_to_markdown(jira_markup)
+        assert jira_preprocessor.markdown_to_jira(markdown).strip() == jira_markup
+
+    @pytest.mark.parametrize(
+        "jira_markup, normalised",
+        [
+            pytest.param(
+                "{panel:title=Notes}\nline one\n{panel}",
+                "{panel:bgColor=#deebff}\n*Notes*\n\nline one\n{panel}",
+                id="wiki-title-becomes-colour-and-bold-content",
+            ),
+            pytest.param(
+                "{info}\ninfo body\n{info}",
+                "{panel:bgColor=#deebff}\ninfo body\n{panel}",
+                id="info-macro-becomes-a-panel",
+            ),
+            pytest.param(
+                "{tip}\ntip body\n{tip}",
+                "{panel:bgColor=#e3fcef}\ntip body\n{panel}",
+                id="tip-macro-becomes-a-success-panel",
+            ),
+            pytest.param(
+                "{expand:Details}\nhidden\n{expand}",
+                "{expand:title=Details}\nhidden\n{expand}",
+                id="expand-gains-the-explicit-title-param",
+            ),
+        ],
+    )
+    def test_server_round_trip_normalises_then_holds(
+        self, jira_preprocessor, jira_markup: str, normalised: str
+    ):
+        """Server/DC spellings normalise to one form, and then stop moving.
+
+        A wiki-authored panel has no colour and a {info}/{tip} macro is not a
+        {panel} tag, so the first cycle rewrites them; a second cycle must be a
+        no-op, or every read/write pair would keep churning the field.
+        """
+        first = jira_preprocessor.markdown_to_jira(
+            jira_preprocessor.jira_to_markdown(jira_markup)
+        ).strip()
+        assert first == normalised
+        second = jira_preprocessor.markdown_to_jira(
+            jira_preprocessor.jira_to_markdown(first)
+        ).strip()
+        assert second == first
+
     def test_jira_nested_lists_preservation(self, jira_preprocessor):
         """Test preservation of nested list structures."""
         jira_markup = """* Level 1 item
