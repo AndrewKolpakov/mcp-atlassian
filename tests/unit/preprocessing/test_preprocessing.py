@@ -1752,33 +1752,37 @@ class TestCodeBlockProtection:
         assert "# comment" in jira_output
         assert "print('hi')" in jira_output
 
-    def test_quote_wrapping_code_loses_blockquote_on_inner_lines(
+    def test_quote_wrapping_code_keeps_the_code_inside_the_quote(
         self,
         preprocessor,
     ):
-        """Document trade-off: {quote} around {code} loses blockquote context.
+        """{quote} around {code} keeps every line of the code quoted.
 
-        Placeholder extraction protects code content from markup
-        corruption, but the {quote} handler cannot reach inside the
-        already-extracted block.  The opening fence line may carry
-        "> " while inner code lines do not.  This is the expected
-        (intentional) behavior.
+        The code is extracted to a placeholder before the {quote} handler
+        runs, so the handler can only prefix the placeholder's line; the
+        prefix is carried into the restored block afterwards.  Jira accepts a
+        codeBlock inside a blockquote, so keeping the code in the quote is
+        what round-trips.
         """
         result = preprocessor.jira_to_markdown("{quote}{code}x = 1{code}{quote}")
-        # Code content is preserved literally
-        assert "x = 1" in result
-        # Code fence is present
-        assert "```" in result
-        # The opening fence gets blockquote prefix from {quote}
-        assert "> ```" in result
-        # Inner code line does NOT get blockquote prefix -- this
-        # is the known trade-off of placeholder-based protection.
-        lines = result.strip().splitlines()
-        code_lines = [ln for ln in lines if ln.strip() and "```" not in ln]
-        for ln in code_lines:
-            assert not ln.startswith("> "), (
-                f"Inner code line unexpectedly blockquoted: {ln!r}"
-            )
+        assert result == "> ```\n> x = 1\n> ```"
+
+    def test_quote_wrapping_prose_and_code_stays_one_blockquote(
+        self,
+        preprocessor,
+    ):
+        """Measured Jira output for a blockquote holding a paragraph and code."""
+        wiki = "{quote}q with code\n\n{code:python}x = 1{code}{quote}"
+        assert preprocessor.jira_to_markdown(wiki) == (
+            "> q with code\n> \n> ```python\n> x = 1\n> ```"
+        )
+
+    def test_code_outside_a_quote_is_not_prefixed(self, preprocessor):
+        """Only a placeholder sitting on a quoted line carries the prefix in."""
+        wiki = "{quote}quoted{quote}\n\n{code:python}x = 1{code}"
+        assert preprocessor.jira_to_markdown(wiki) == (
+            "> quoted\n\n```python\nx = 1\n```"
+        )
 
 
 class TestHtmlConversionCodeProtection:

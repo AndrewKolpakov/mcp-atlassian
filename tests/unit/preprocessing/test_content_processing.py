@@ -236,16 +236,21 @@ See [PROJ-123|https://example.atlassian.net/browse/PROJ-123|smart-link] for deta
                 ":::note\nplain note\n:::",
                 id="note-macro",
             ),
+            pytest.param(
+                "{quote}q with code\n\n{code:python}x = 1{code}{quote}",
+                "> q with code\n> \n> ```python\n> x = 1\n> ```",
+                id="quote-holding-code",
+            ),
         ],
     )
     def test_jira_block_markup_survives_the_full_pipeline(
         self, jira_preprocessor, jira_markup: str, expected: str
     ):
-        """Panels and macros survive the HTML pass clean_jira_text runs.
+        """Panels, macros and quotes survive the HTML pass clean_jira_text runs.
 
-        jira_to_markdown emits ``:::`` fences, and _convert_html_to_markdown
-        then runs over the whole field; the fence may not be rewritten on the
-        way through.
+        jira_to_markdown emits ``:::`` fences and ``> `` lines, and
+        _convert_html_to_markdown then runs over the whole field; neither the
+        fence nor the quote prefix may be rewritten on the way through.
         """
         assert jira_preprocessor.clean_jira_text(jira_markup) == expected
 

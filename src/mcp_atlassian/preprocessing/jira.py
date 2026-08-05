@@ -366,6 +366,13 @@ _BLOCK_MACRO_PATTERN = re.compile(
     r"\{(" + "|".join(_BLOCK_MACRO_TAGS) + r")(?::([^}\n]*))?\}", re.IGNORECASE
 )
 
+# A code block is pulled out to a placeholder before the ``{quote}`` handler
+# runs, so the handler prefixes the placeholder's line and cannot reach the
+# lines it stands for.  This finds such a line to carry the prefix inwards.
+_QUOTED_CODEBLOCK_PATTERN = re.compile(
+    r"^((?:> )+)(?=\x00CODEBLOCK(\d+)\x00)", re.MULTILINE
+)
+
 
 def _convert_quote_block(match: re.Match[str]) -> str:
     """Convert one ``{quote}`` block to ``> ``-prefixed markdown lines.
@@ -559,6 +566,31 @@ def _convert_block_macros(text: str) -> str:
     tail = text[position:]
     parts.append(tail.removeprefix("\n") if after_fence else tail)
     return "".join(parts)
+
+
+def _carry_quote_prefix_into_code_blocks(text: str, code_blocks: list[str]) -> None:
+    """Prefix a code block sitting inside ``{quote}`` with the quote marker.
+
+    The ``{quote}`` handler prefixes the placeholder's line with ``"> "`` but
+    cannot reach the lines the placeholder stands for, so restoring the block
+    as-is ends the blockquote at the opening fence and drops the code out of
+    the quote -- even though Jira accepts a ``codeBlock`` inside a
+    ``blockquote``.  Each placeholder occurs exactly once, so the stored block
+    is rewritten in place with the prefix its line carries.
+
+    Args:
+        text: Text with the code placeholders back in place, i.e. after
+            ``_restore_escaped_chars`` and before ``_restore_blocks``.
+        code_blocks: Stored code blocks, rewritten in place.
+    """
+    if not code_blocks:
+        return
+    for match in _QUOTED_CODEBLOCK_PATTERN.finditer(text):
+        index = int(match.group(2))
+        # A field can arrive holding a placeholder-shaped sequence of its own
+        # (see _NUL_PLACEHOLDER), so the index is not trusted to be one of ours.
+        if index < len(code_blocks):
+            code_blocks[index] = code_blocks[index].replace("\n", f"\n{match.group(1)}")
 
 
 class JiraPreprocessor(BasePreprocessor):
@@ -766,15 +798,13 @@ class JiraPreprocessor(BasePreprocessor):
         # Protect code/noformat/inline-code blocks from downstream
         # transformations by replacing them with placeholders.
         #
-        # Trade-off: when {quote} wraps a {code} block, the code
-        # content is extracted *before* the {quote} handler runs.
-        # The {quote} handler prefixes each remaining line with
-        # "> " but cannot reach inside the already-extracted block.
-        # After restoration the opening fence line may carry "> "
-        # while inner code lines do not, breaking blockquote
-        # continuity.  This is intentional: protecting code content
-        # from markup corruption is more important than preserving
-        # blockquote indentation around code fences.
+        # A {code} block inside {quote} is extracted before the
+        # {quote} handler runs, so the handler prefixes only the
+        # placeholder's line and the restored fence would end the
+        # blockquote at its first line.  Jira accepts a codeBlock
+        # inside a blockquote, so the prefix is carried into the
+        # block at restore time instead -- see
+        # _carry_quote_prefix_into_code_blocks.
         code_blocks: list[str] = []
         inline_codes: list[str] = []
 
@@ -899,6 +929,7 @@ class JiraPreprocessor(BasePreprocessor):
 
         # Restore escapes as markdown escapes, then code/inline code
         output = _restore_escaped_chars(output)
+        _carry_quote_prefix_into_code_blocks(output, code_blocks)
         output = _restore_blocks(output, code_blocks, "CODEBLOCK")
         output = _restore_blocks(output, inline_codes, "INLINECODE")
 
