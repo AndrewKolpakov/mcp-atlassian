@@ -9,6 +9,8 @@ import copy
 import json
 import logging
 import re
+from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -669,7 +671,9 @@ def _absorb_list_item_continuation(
     body = [line for line in collected if line.strip()]
     strip_width = min(len(line) - len(line.lstrip()) for line in body)
     dedented = [line[strip_width:] if line.strip() else "" for line in collected]
-    inner = markdown_to_adf("\n".join(dedented), jira_base_url, known_project_keys)
+    inner = _markdown_to_adf_unchecked(
+        "\n".join(dedented), jira_base_url, known_project_keys
+    )
     item["content"].extend(inner["content"])
     return cursor
 
@@ -1135,7 +1139,7 @@ def _make_expand_node(
     Returns:
         ADF expand node.
     """
-    inner_doc = markdown_to_adf(
+    inner_doc = _markdown_to_adf_unchecked(
         "\n".join(body_lines), jira_base_url, known_project_keys
     )
     return {
@@ -1145,12 +1149,19 @@ def _make_expand_node(
     }
 
 
-def markdown_to_adf(
+def _markdown_to_adf_unchecked(
     markdown_text: str,
     jira_base_url: str = "",
     known_project_keys: set[str] | None = None,
 ) -> dict[str, Any]:
     """Convert Markdown text to ADF (Atlassian Document Format) document.
+
+    Produces the document WITHOUT checking it for mark conflicts, so that a
+    recursive call from a blockquote, panel or expand cannot abort the outer
+    walk and hide every violation that follows it. Callers want
+    :func:`markdown_to_adf`, which parses through here and then validates the
+    finished document once, at the top, with the original text still in hand
+    to report line numbers against.
 
     Implements a line-by-line parser that handles common Markdown constructs.
     ``:::info|note|warning|success|error`` fences become ADF panels, ``:::tip``
@@ -1307,7 +1318,7 @@ def markdown_to_adf(
             if panel_type in _PANEL_TYPES:
                 panel_lines, i = _collect_fence_lines(lines, i)
                 # Recursively parse panel content
-                inner_doc = markdown_to_adf(
+                inner_doc = _markdown_to_adf_unchecked(
                     "\n".join(panel_lines), jira_base_url, project_keys
                 )
                 panel_node: dict[str, Any] = {
@@ -1354,6 +1365,328 @@ def markdown_to_adf(
         doc["content"].append({"type": "paragraph", "content": []})
 
     return doc
+
+
+# --- Mark-conflict validation -------------------------------------------------
+#
+# A text node may carry ``code`` beside exactly one other mark, ``link``. Pair
+# it with ``strong``, ``em``, ``strike`` or anything else and Jira Cloud refuses
+# the WHOLE document with a 400 that names no field -- not the offending
+# paragraph, the entire write, so nothing is stored at all. That was measured
+# against the live API four times before this check existed.
+#
+# The refusal below is deliberately an error rather than a silent repair. The
+# converter could drop the outer mark and produce a document Jira accepts, and
+# that was the first design; it is worse. A body silently rewritten on the way
+# out is a body the author never learns was wrong, and the next one repeats it.
+_CODE_COMPATIBLE_MARK_TYPES = frozenset({"code", "link"})
+
+# Emphasis spans, used ONLY to build the suggested rewrite. Detection runs on
+# the converted document, which is authoritative; if this pattern misses a span
+# the violation is still reported, just without a ready-made fix. Keeping it out
+# of the decision is what stops it from becoming a second, drifting definition
+# of what Jira refuses.
+#
+# A ``**`` or ``***`` delimiter survives an asterisk inside a code span, a lone
+# ``*`` does not -- ``*see `a/*` here*`` closes at the inner asterisk. Hence two
+# character classes rather than one.
+_EMPHASIS_STAR_BODY = r"(?:[^*`\n]|`[^`\n]*`)"
+_EMPHASIS_NOSTAR_BODY = r"(?:[^*`\n]|`[^*`\n]*`)"
+_EMPHASIS_SPAN_RE = re.compile(
+    rf"(?P<d3>\*\*\*)(?P<b3>{_EMPHASIS_STAR_BODY}+?)\*\*\*"
+    rf"|(?P<d2>\*\*)(?P<b2>{_EMPHASIS_STAR_BODY}+?)\*\*"
+    rf"|(?<!\*)(?P<d1>\*)(?P<b1>{_EMPHASIS_NOSTAR_BODY}+?)\*(?!\*)"
+    rf"|(?P<ds>~~)(?P<bs>(?:[^~`\n]|`[^`\n]*`)+?)~~"
+)
+
+# A fenced block, blanked before the source is searched for an offending code
+# span. A body that DOCUMENTS this defect quotes the construct inside a fence,
+# where it is a codeBlock and carries no marks at all; without this the quote
+# would steal the line number from the real violation further down.
+_FENCED_BLOCK_RE = re.compile(
+    r"^ {0,3}(?P<fence>`{3,}|~{3,})[^\n]*\n.*?(?:^ {0,3}(?P=fence)[^\n]*$|\Z)",
+    re.S | re.M,
+)
+
+_CODE_SPAN_RE = re.compile(r"(?P<ticks>`+)(?P<body>.+?)(?P=ticks)")
+
+
+@dataclass(frozen=True)
+class MarkConflict:
+    """One text run Jira would refuse: ``code`` stacked with another mark."""
+
+    text: str
+    conflicting_marks: tuple[str, ...]
+    line: int | None = None
+    source_line: str | None = None
+    suggestion: str | None = None
+    origin: str | None = None
+
+    def describe(self) -> str:
+        """Render one violation as the two or three lines a fixer needs."""
+        where = f"line {self.line}" if self.line is not None else "line not located"
+        prefix = f"{self.origin} " if self.origin else ""
+        marks = ", ".join(self.conflicting_marks)
+        out = [f"  {prefix}{where}: code span `{self.text}` also carries: {marks}"]
+        if self.source_line is not None:
+            out.append(f"      written: {self.source_line.strip()}")
+        if self.suggestion is not None:
+            out.append(f"      fix to:  {self.suggestion.strip()}")
+        return "\n".join(out)
+
+
+class AdfMarkConflictError(ValueError):
+    """Raised when a body would make Jira refuse the write and store nothing.
+
+    Carries EVERY offending construct found in one conversion, never the first
+    one only. Fail-fast would be cheaper to write and costs the author a round
+    trip per defect: fix one, resend, get refused on the next. The list is the
+    whole point of the exception -- one edit clears the body.
+    """
+
+    #: Past this many the message summarises instead of listing, so a
+    #: pathological body cannot produce an error nobody can read.
+    MAX_LISTED = 20
+
+    def __init__(
+        self, conflicts: list[MarkConflict], subject: str = "this body"
+    ) -> None:
+        self.conflicts = list(conflicts)
+        self.subject = subject
+        super().__init__(self._render())
+
+    def _render(self) -> str:
+        total = len(self.conflicts)
+        plural = "s" if total != 1 else ""
+        head = (
+            f"Jira would refuse this write and store nothing: {total} "
+            f"construct{plural} in {self.subject} put a `code` span inside "
+            "another mark, which ADF permits only for links.\n"
+            "All of them are listed below, so one edit clears the text; the "
+            "usual fix is to close the emphasis before the code span and "
+            "reopen it after."
+        )
+        shown = self.conflicts[: self.MAX_LISTED]
+        body = "\n".join(conflict.describe() for conflict in shown)
+        tail = ""
+        if total > len(shown):
+            tail = f"\n  ... and {total - len(shown)} more of the same kind."
+        return f"{head}\n\n{body}{tail}"
+
+
+def _iter_code_mark_conflicts(node: Any) -> Iterator[tuple[str, tuple[str, ...]]]:
+    """Walk a finished document, yielding every text run Jira would refuse.
+
+    Args:
+        node: Any ADF node, list of nodes, or the document itself.
+
+    Yields:
+        The code span's text and the mark types that may not sit beside it,
+        in document order.
+    """
+    if isinstance(node, list):
+        for item in node:
+            yield from _iter_code_mark_conflicts(item)
+        return
+    if not isinstance(node, dict):
+        return
+
+    if node.get("type") == "text":
+        marks = node.get("marks") or []
+        types = [
+            str(mark["type"])
+            for mark in marks
+            if isinstance(mark, dict) and mark.get("type")
+        ]
+        if "code" in types:
+            offending = tuple(
+                sorted({t for t in types if t not in _CODE_COMPATIBLE_MARK_TYPES})
+            )
+            if offending:
+                yield str(node.get("text", "")), offending
+
+    for value in node.values():
+        if isinstance(value, (list, dict)):
+            yield from _iter_code_mark_conflicts(value)
+
+
+def _mask_fenced_blocks(markdown_text: str) -> str:
+    """Blank fenced blocks, keeping every line number and every newline."""
+    return _FENCED_BLOCK_RE.sub(
+        lambda match: re.sub(r"[^\n]", " ", match.group(0)), markdown_text
+    )
+
+
+def _emphasise(fragment: str, delimiter: str) -> str:
+    """Wrap a fragment in a delimiter, keeping its surrounding whitespace out.
+
+    ``**T1 of **`` is not bold in CommonMark -- a closing run may not follow
+    whitespace -- so a naive split would hand the author markup that is broken
+    in a second way. An all-whitespace fragment is returned bare, because
+    emphasising nothing would emit ``****``.
+    """
+    core = fragment.strip()
+    if not core:
+        return fragment
+    lead = fragment[: len(fragment) - len(fragment.lstrip())]
+    trail = fragment[len(fragment.rstrip()) :]
+    return f"{lead}{delimiter}{core}{delimiter}{trail}"
+
+
+def _split_emphasis_around_code(body: str, delimiter: str) -> str | None:
+    """Rebuild an emphasis span so its code spans sit outside the emphasis."""
+    pieces: list[str] = []
+    position = 0
+    for match in _CODE_SPAN_RE.finditer(body):
+        pieces.append(_emphasise(body[position : match.start()], delimiter))
+        pieces.append(match.group(0))
+        position = match.end()
+    if not pieces:
+        return None
+    pieces.append(_emphasise(body[position:], delimiter))
+    return "".join(pieces)
+
+
+def _suggest_rewrite(source_line: str, code_text: str) -> str | None:
+    """Return the line rewritten so Jira accepts it, or None if unclear.
+
+    Best-effort by design: a suggestion that cannot be derived is omitted, and
+    the violation is still reported with its line number.
+    """
+    for match in _EMPHASIS_SPAN_RE.finditer(source_line):
+        body = next(
+            group
+            for group in (
+                match.group("b3"),
+                match.group("b2"),
+                match.group("b1"),
+                match.group("bs"),
+            )
+            if group is not None
+        )
+        delimiter = next(
+            group
+            for group in (
+                match.group("d3"),
+                match.group("d2"),
+                match.group("d1"),
+                match.group("ds"),
+            )
+            if group is not None
+        )
+        if code_text not in body:
+            continue
+        rebuilt = _split_emphasis_around_code(body, delimiter)
+        if rebuilt is None:
+            return None
+        return source_line[: match.start()] + rebuilt + source_line[match.end() :]
+    return None
+
+
+def _locate_conflicts(
+    raw_conflicts: list[tuple[str, tuple[str, ...]]], markdown_text: str
+) -> list[MarkConflict]:
+    """Attach a line number, the written line and a suggested fix to each.
+
+    Repeats of the same code span are handed successive occurrences rather than
+    all pointing at the first, so a body that goes wrong twice the same way
+    still names two places to edit.
+    """
+    masked_lines = _mask_fenced_blocks(markdown_text).split("\n")
+    raw_lines = markdown_text.split("\n")
+    seen: dict[str, int] = {}
+    located: list[MarkConflict] = []
+
+    for code_text, offending in raw_conflicts:
+        hits = [i for i, line in enumerate(masked_lines) if f"`{code_text}`" in line]
+        if not hits:
+            # A span written with two or more backticks, or one holding a
+            # backtick of its own; the bare text still locates the line.
+            hits = [i for i, line in enumerate(masked_lines) if code_text in line]
+        index = seen.get(code_text, 0)
+        seen[code_text] = index + 1
+
+        line_number = None
+        source_line = None
+        suggestion = None
+        if index < len(hits):
+            line_number = hits[index] + 1
+            source_line = raw_lines[hits[index]]
+            suggestion = _suggest_rewrite(source_line, code_text)
+
+        located.append(
+            MarkConflict(
+                text=code_text,
+                conflicting_marks=offending,
+                line=line_number,
+                source_line=source_line,
+                suggestion=suggestion,
+            )
+        )
+
+    return located
+
+
+def find_mark_conflicts(
+    markdown_text: str,
+    jira_base_url: str = "",
+    known_project_keys: set[str] | None = None,
+) -> list[MarkConflict]:
+    """Report every construct in a body that Jira would refuse the write over.
+
+    The check a caller wants when it needs the list rather than an exception --
+    a pre-send gate, or a batch validating several bodies before writing any.
+
+    Args:
+        markdown_text: Body to check, in Markdown.
+        jira_base_url: Jira base URL used to link bare issue keys.
+        known_project_keys: Normalized allowlist of project keys whose issue
+            keys may be linked; None links every issue-key-shaped token.
+
+    Returns:
+        Every conflict in document order; empty when the body is acceptable.
+    """
+    document = _markdown_to_adf_unchecked(
+        markdown_text, jira_base_url, known_project_keys
+    )
+    return _locate_conflicts(list(_iter_code_mark_conflicts(document)), markdown_text)
+
+
+def markdown_to_adf(
+    markdown_text: str,
+    jira_base_url: str = "",
+    known_project_keys: set[str] | None = None,
+) -> dict[str, Any]:
+    """Convert Markdown to an ADF document, refusing one Jira will not store.
+
+    Parsing is :func:`_markdown_to_adf_unchecked`; this adds the one check that
+    cannot be left to the API, because the API's answer is a 400 naming no
+    field. Validation runs once on the finished document, so a violation inside
+    a panel, blockquote or expand is found together with the rest and the
+    author gets the whole list at once.
+
+    Args:
+        markdown_text: Text in Markdown format.
+        jira_base_url: Jira base URL used to link bare issue keys.
+        known_project_keys: Normalized allowlist of project keys whose issue
+            keys may be linked; None links every issue-key-shaped token.
+
+    Returns:
+        The ADF document.
+
+    Raises:
+        AdfMarkConflictError: If any text run pairs ``code`` with a mark ADF
+            does not allow beside it. Carries every such run, not the first.
+    """
+    document = _markdown_to_adf_unchecked(
+        markdown_text, jira_base_url, known_project_keys
+    )
+    conflicts = _locate_conflicts(
+        list(_iter_code_mark_conflicts(document)), markdown_text
+    )
+    if conflicts:
+        raise AdfMarkConflictError(conflicts)
+    return document
 
 
 def _adf_node_contains_media(node: dict[str, Any]) -> bool:

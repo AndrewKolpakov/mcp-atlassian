@@ -28,7 +28,13 @@ from mcp_atlassian.utils.ssrf_adapter import mount_ssrf_pinning
 from mcp_atlassian.utils.urls import make_ssrf_redirect_hook
 from mcp_atlassian.utils.user_agent import get_default_user_agent
 
-from ..models.jira.adf import adf_to_markdown, markdown_to_adf
+from ..models.jira.adf import (
+    AdfMarkConflictError,
+    MarkConflict,
+    adf_to_markdown,
+    find_mark_conflicts,
+    markdown_to_adf,
+)
 from .config import JiraConfig, normalize_project_key
 
 # Configure logging
@@ -364,6 +370,29 @@ class JiraClient:
             return ""
         return self._clean_text(str(raw_value))
 
+    def _find_mark_conflicts(self, markdown_text: str) -> list[MarkConflict]:
+        """Report constructs in a body that would make Jira refuse the write.
+
+        The same conversion and the same configuration as
+        :meth:`_markdown_to_jira`, stopping short of the write, so a caller
+        holding several bodies can check them all before writing any of them.
+        Empty on Server/DC, which sends wiki markup and has no ADF to be
+        refused over.
+
+        Args:
+            markdown_text: Body to check, in Markdown.
+
+        Returns:
+            Every conflict in document order; empty when the body is fine.
+        """
+        if not markdown_text or not self.config.is_cloud:
+            return []
+        return find_mark_conflicts(
+            markdown_text,
+            jira_base_url=self.config.url,
+            known_project_keys=_parse_known_project_keys(self.config.projects_filter),
+        )
+
     def _markdown_to_jira(self, markdown_text: str) -> str | dict[str, Any]:
         """Convert Markdown to Jira format (ADF for Cloud, wiki markup for Server).
 
@@ -390,6 +419,13 @@ class JiraClient:
                         self.config.projects_filter
                     ),
                 )
+            except AdfMarkConflictError:
+                # Jira stores NOTHING for a body carrying this construct, so
+                # the fallback below would not be degrading gracefully -- it
+                # would publish the author's Markdown as literal text under a
+                # field they believe rendered, and never tell them. Refuse
+                # instead; the message names every offending line.
+                raise
             except Exception as e:
                 logger.warning(f"Error converting markdown to ADF: {e}")
                 return {

@@ -4,6 +4,7 @@ import json
 import logging
 import time
 from collections import defaultdict
+from dataclasses import replace
 from typing import Any
 
 from requests.exceptions import ConnectionError as RequestsConnectionError
@@ -11,7 +12,11 @@ from requests.exceptions import HTTPError
 
 from ..exceptions import MCPAtlassianAuthenticationError
 from ..models.jira import JiraIssue
-from ..models.jira.adf import merge_adf_with_preserved_media
+from ..models.jira.adf import (
+    AdfMarkConflictError,
+    MarkConflict,
+    merge_adf_with_preserved_media,
+)
 from ..models.jira.common import JiraChangelog
 from ..utils import parse_date
 from .client import JiraClient
@@ -1909,6 +1914,43 @@ class IssuesMixin(
             logger.error(f"Error transitioning issue {issue_key}: {str(e)}")
             raise
 
+    def _reject_batch_bodies_jira_would_refuse(
+        self, issues: list[dict[str, Any]]
+    ) -> None:
+        """Refuse the whole batch up front if any description would be rejected.
+
+        The preparation loop below converts one description at a time, and its
+        handler drops an issue that fails to prepare and carries on as soon as
+        one issue has already been prepared. For a body Jira refuses whole that
+        is the worst available answer: the batch returns short, the caller is
+        told nothing, and the missing issue is indistinguishable from one that
+        was never asked for.
+
+        Checking every body before any issue is prepared turns that into a
+        single error naming every offending line across the whole batch, so a
+        caller edits once and resends once instead of paying a round trip per
+        bad body -- and no issue is created while a sibling is known bad.
+
+        Args:
+            issues: The batch as handed in, before any field is popped.
+
+        Raises:
+            AdfMarkConflictError: If any description would make Jira refuse.
+        """
+        conflicts: list[MarkConflict] = []
+        for position, issue_data in enumerate(issues, start=1):
+            description = issue_data.get("description") or ""
+            if not description:
+                continue
+            summary = issue_data.get("summary") or "no summary"
+            conflicts.extend(
+                replace(conflict, origin=f'issue {position} ("{summary}")')
+                for conflict in self._find_mark_conflicts(description)
+            )
+
+        if conflicts:
+            raise AdfMarkConflictError(conflicts, subject="this batch")
+
     def batch_create_issues(
         self,
         issues: list[dict[str, Any]],
@@ -1936,6 +1978,10 @@ class IssuesMixin(
         """
         if not issues:
             return []
+
+        # Before anything is prepared or created: one bad body must not come
+        # back as a silently shorter batch. See the method's docstring.
+        self._reject_batch_bodies_jira_would_refuse(issues)
 
         # Prepare issues for bulk creation
         issue_updates = []
@@ -2001,6 +2047,14 @@ class IssuesMixin(
                 # Add to bulk creation list
                 issue_updates.append({"fields": fields})
 
+            except AdfMarkConflictError:
+                # The pre-check above reads `description`; a body Jira refuses
+                # whole also reaches here from a custom textarea field, via
+                # _process_additional_fields -> FieldsMixin -> _markdown_to_jira.
+                # Letting the handler below drop it would be the same silently
+                # shorter batch by another route. Nothing has been written yet:
+                # the bulk create runs after this loop.
+                raise
             except Exception as e:
                 logger.error(f"Failed to prepare issue for creation: {str(e)}")
                 if not issue_updates:

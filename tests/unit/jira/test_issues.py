@@ -12,6 +12,7 @@ from mcp_atlassian.jira import JiraFetcher
 from mcp_atlassian.jira.constants import DEFAULT_READ_JIRA_FIELDS
 from mcp_atlassian.jira.issues import IssuesMixin, logger
 from mcp_atlassian.models.jira import JiraIssue
+from mcp_atlassian.models.jira.adf import AdfMarkConflictError, MarkConflict
 from tests.utils.mocks import setup_api3_passthrough_mocks
 
 
@@ -3480,3 +3481,152 @@ class TestEnvironmentField:
         result = jira_fetcher.get_issue("TEST-123")
 
         assert result.environment == "- **staging**"
+
+
+class TestBatchCreateRefusesBodiesJiraWouldReject:
+    """A body Jira refuses must not come back as a silently shorter batch.
+
+    The preparation loop drops an issue that fails to prepare and carries on as
+    soon as one issue has already been prepared, logging at error level and
+    telling the caller nothing. So before this check, a bad description in the
+    *second* issue created the first and the third and returned two issues --
+    indistinguishable from a batch that was only ever asked for two.
+
+    Checking every body before any issue is prepared turns that into one error
+    naming every offending line across the whole batch.
+    """
+
+    FLAGSHIP = "- **T1 of `plans/foo.md`** (tail)"
+
+    @pytest.fixture
+    def cloud_mixin(self, jira_fetcher: JiraFetcher) -> IssuesMixin:
+        mixin = jira_fetcher
+        # is_cloud is derived from the URL, not settable; this is the spelling
+        # the other Cloud fixtures in this file use.
+        mixin.config.url = "https://test.atlassian.net"
+        mixin._get_account_id = MagicMock(return_value="test-account-id")
+        # The Cloud ADF path posts to /rest/api/3; route it back to the
+        # jira.create_issues mock so "nothing was created" stays assertable.
+        setup_api3_passthrough_mocks(mixin)
+        return mixin
+
+    def _issue(self, summary: str, description: str) -> dict[str, Any]:
+        return {
+            "project_key": "TEST",
+            "summary": summary,
+            "issue_type": "Task",
+            "description": description,
+        }
+
+    def test_a_bad_body_in_the_second_issue_refuses_the_whole_batch(
+        self, cloud_mixin: IssuesMixin
+    ):
+        issues = [
+            self._issue("Good one", "Plain description."),
+            self._issue("Bad one", self.FLAGSHIP),
+            self._issue("Another good one", "Also plain."),
+        ]
+
+        with pytest.raises(AdfMarkConflictError) as excinfo:
+            cloud_mixin.batch_create_issues(issues)
+
+        assert 'issue 2 ("Bad one")' in str(excinfo.value)
+        cloud_mixin.jira.create_issues.assert_not_called()
+
+    def test_the_error_names_every_bad_issue_in_the_batch(
+        self, cloud_mixin: IssuesMixin
+    ):
+        """One edit, one resend -- not one round trip per bad body."""
+        issues = [
+            self._issue("Bad one", self.FLAGSHIP),
+            self._issue("Good one", "Plain description."),
+            self._issue("Bad two", "~~drop `legacy_flag` now~~"),
+        ]
+
+        with pytest.raises(AdfMarkConflictError) as excinfo:
+            cloud_mixin.batch_create_issues(issues)
+
+        message = str(excinfo.value)
+        assert len(excinfo.value.conflicts) == 2
+        assert 'issue 1 ("Bad one")' in message
+        assert 'issue 3 ("Bad two")' in message
+        assert "plans/foo.md" in message
+        assert "legacy_flag" in message
+
+    def test_the_batch_is_refused_before_anything_is_prepared(
+        self, cloud_mixin: IssuesMixin
+    ):
+        """The issues are handed back untouched, so a retry can reuse them.
+
+        The preparation loop ``pop``s its fields off each dict. Refusing after
+        it started would leave the caller's own input half-consumed.
+        """
+        issues = [self._issue("Bad one", self.FLAGSHIP)]
+
+        with pytest.raises(AdfMarkConflictError):
+            cloud_mixin.batch_create_issues(issues)
+
+        assert issues[0]["summary"] == "Bad one"
+        assert issues[0]["description"] == self.FLAGSHIP
+
+    def test_a_clean_batch_is_unaffected(self, cloud_mixin: IssuesMixin):
+        issues = [self._issue("Good one", "Plain description.")]
+        cloud_mixin.jira.create_issues.return_value = {
+            "issues": [{"id": "1", "key": "TEST-1"}],
+            "errors": [],
+        }
+        cloud_mixin.jira.get_issue.return_value = {
+            "id": "1",
+            "key": "TEST-1",
+            "fields": {"summary": "Good one"},
+        }
+
+        result = cloud_mixin.batch_create_issues(issues)
+
+        assert [issue.key for issue in result] == ["TEST-1"]
+
+    def test_server_batches_are_unaffected(self, jira_fetcher: JiraFetcher):
+        """Server/DC sends wiki markup, so there is no ADF to be refused over."""
+        jira_fetcher.config.url = "https://jira.example.com"
+        jira_fetcher._get_account_id = MagicMock(return_value="test-account-id")
+        jira_fetcher.jira.create_issues.return_value = {
+            "issues": [{"id": "1", "key": "TEST-1"}],
+            "errors": [],
+        }
+        jira_fetcher.jira.get_issue.return_value = {
+            "id": "1",
+            "key": "TEST-1",
+            "fields": {"summary": "Bad one"},
+        }
+
+        result = jira_fetcher.batch_create_issues(
+            [self._issue("Bad one", self.FLAGSHIP)]
+        )
+
+        assert [issue.key for issue in result] == ["TEST-1"]
+
+    def test_a_bad_custom_textarea_field_also_refuses_the_batch(
+        self, cloud_mixin: IssuesMixin
+    ):
+        """The pre-check reads `description`; a custom textarea goes another way.
+
+        _process_additional_fields converts textarea custom fields inside the
+        preparation loop, so a body Jira refuses whole arrives there rather than
+        at the pre-check. Without the narrow re-raise the generic handler drops
+        that issue and the batch comes back short -- the same defect, a
+        different field.
+        """
+        issues = [
+            self._issue("First", "Plain description."),
+            self._issue("Second", "Plain description."),
+        ]
+        cloud_mixin._process_additional_fields = MagicMock(
+            side_effect=AdfMarkConflictError(
+                [MarkConflict(text="plans/foo.md", conflicting_marks=("strong",))]
+            )
+        )
+
+        with pytest.raises(AdfMarkConflictError):
+            cloud_mixin.batch_create_issues(issues)
+
+        cloud_mixin.jira.create_issues.assert_not_called()
