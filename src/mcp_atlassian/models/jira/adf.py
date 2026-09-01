@@ -1531,7 +1531,7 @@ def _iter_code_mark_conflicts(node: Any) -> Iterator[tuple[str, tuple[str, ...]]
                 yield str(node.get("text", "")), offending
 
     for value in node.values():
-        if isinstance(value, (list, dict)):
+        if isinstance(value, list | dict):
             yield from _iter_code_mark_conflicts(value)
 
 
