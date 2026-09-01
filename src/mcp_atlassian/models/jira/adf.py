@@ -60,6 +60,19 @@ _JIRA_ISSUE_KEY_RE = re.compile(
 _VALID_STATUS_COLORS = frozenset(
     {"neutral", "purple", "blue", "red", "yellow", "green"}
 )
+# The status-lozenge token, minus its opening brace, defined once because three
+# places must agree on it exactly: ``_parse_inline_formatting`` consumes it,
+# ``_escape_inline_markdown`` escapes a literal that would otherwise be consumed
+# as one, and ``_render_table_cell`` rewrites it.  A reader that escapes less
+# than the writer parses silently turns prose into a lozenge, so these must not
+# drift apart.
+_STATUS_LOZENGE_BODY = (
+    r"status:(?:color=(?P<status_color>\w+)\|)?title=(?P<status_title>[^}]+)\}"
+)
+# Only an *unescaped* lozenge is markup. ``_escape_inline_markdown`` writes
+# ``\{status:...}`` for prose that merely looks like one, and rewriting that
+# would edit the author's text -- the very corruption the escape prevents.
+_UNESCAPED_STATUS_LOZENGE_RE = re.compile(rf"(?<!\\)\{{{_STATUS_LOZENGE_BODY}")
 
 
 def _normalize_known_project_keys(
@@ -282,8 +295,7 @@ def _parse_inline_formatting(
         r"|@\[(?P<display_mention_text>[^\]]+)\]"
         r"\(accountid:(?P<display_mention_id>[^)]+)\)"
         r"|`(?P<code_inner>[^`]+)`"
-        r"|\{status:(?:color=(?P<status_color>\w+)\|)?"
-        r"title=(?P<status_title>[^}]+)\}"
+        rf"|\{{{_STATUS_LOZENGE_BODY}"
         r"|\*\*\*(?P<bold_italic_inner>.+?)\*\*\*"
         r"|\*\*(?P<bold_inner>.+?)\*\*"
         r"|~~(?P<strike_inner>.+?)~~"
@@ -1782,6 +1794,58 @@ def merge_adf_with_preserved_media(
     return merged
 
 
+def _render_status(text: str, color: Any) -> str:
+    """Render an ADF ``status`` node as Markdown the writer parses back.
+
+    ``{status:color=green|title=Done}`` is the spelling
+    :func:`_parse_inline_formatting` turns back into a status node, so emitting
+    it keeps a lozenge -- and its colour -- across a read/write cycle. The older
+    ``\\[Done\\]`` spelling read back as literal text, losing the node.
+
+    The token is only emitted once the round trip has been *verified against the
+    real parser* rather than against a second copy of its pattern: a title
+    carrying ``}`` would end the token early and strand its tail, and a title
+    that reparses as anything but one status node would corrupt the field. Such
+    a node falls back to the escaped-bracket form, whose brackets keep a status
+    followed by parenthesised prose from re-parsing as a Markdown link.
+
+    The colour is preserved when Jira recognises it and coerced to ``neutral``
+    otherwise -- exactly what the writer does with an unknown one -- so a bad
+    colour costs the colour, never the lozenge. ``style`` is not carried over:
+    the writer always writes ``""``.
+
+    Args:
+        text: The lozenge's label, from ``attrs.text``.
+        color: The raw ``attrs.color``, which is remote JSON and may be junk.
+
+    Returns:
+        The token form when it round-trips, else the escaped-bracket fallback.
+    """
+    expected_color = (
+        color.lower()
+        if isinstance(color, str) and color.lower() in _VALID_STATUS_COLORS
+        else "neutral"
+    )
+    # A newline would survive the parser check -- ``[^}]`` matches it -- but not
+    # the line-oriented block rendering that runs after this, so it is refused
+    # here rather than left to corrupt the surrounding document.
+    if text and "\n" not in text:
+        token = (
+            f"{{status:title={text}}}"
+            if expected_color == "neutral"
+            else f"{{status:color={expected_color}|title={text}}}"
+        )
+        parsed = _parse_inline_formatting(token)
+        if (
+            len(parsed) == 1
+            and parsed[0].get("type") == "status"
+            and _adf_attrs(parsed[0]).get("text") == text
+            and _adf_attrs(parsed[0]).get("color") == expected_color
+        ):
+            return token
+    return f"\\[{_escape_inline_markdown(text)}\\]"
+
+
 def _escape_inline_markdown(text: str) -> str:
     """Escape the characters ``_parse_inline_formatting`` would otherwise consume.
 
@@ -1794,13 +1858,23 @@ def _escape_inline_markdown(text: str) -> str:
     deliberately left alone -- the writer does not read it as emphasis, so
     escaping it would only add noise to ``snake_case`` prose.
 
+    A brace is escaped only when it opens a complete status token, so prose
+    that happens to contain ``{status:title=Done}`` stays that literal string
+    instead of becoming a lozenge on the next write. Every other ``{`` is left
+    alone: the writer reads a brace as markup only in this one shape, and
+    escaping the rest would add noise to JSON-ish prose.
+
     Args:
         text: Literal text from an ADF ``text`` node.
 
     Returns:
         The same text, safe to re-parse as Markdown.
     """
-    return re.sub(r"[\\`*\[\]]|~(?=~)", lambda m: "\\" + m.group(0), text)
+    return re.sub(
+        rf"[\\`*\[\]]|~(?=~)|\{{(?={_STATUS_LOZENGE_BODY})",
+        lambda m: "\\" + m.group(0),
+        text,
+    )
 
 
 def _escape_block_start(line: str) -> str:
@@ -1944,9 +2018,7 @@ def _render_inline_node(node: dict[str, Any]) -> str:
 
     if node_type == "status":
         attrs = _adf_attrs(node)
-        # The bracket is escaped so that a status followed by parenthesised
-        # prose cannot re-parse as a Markdown link.
-        return f"\\[{_escape_inline_markdown(str(attrs.get('text', '')))}\\]"
+        return _render_status(str(attrs.get("text", "")), attrs.get("color"))
 
     if node_type == "inlineCard":
         attrs = _adf_attrs(node)
@@ -2187,9 +2259,19 @@ def _render_table_cell(cell: dict[str, Any]) -> str:
 
     A pipe table row is one line, so a cell holding several blocks is joined
     with spaces and its pipes are escaped.
+
+    A status lozenge loses its colour here. The colour form of the token
+    separates colour from title with ``|`` -- the cell separator -- and the
+    escape below would leave the writer a ``\\|`` its pattern does not match,
+    so the whole token would come back as literal text. Dropping to the
+    title-only form keeps the lozenge itself, which the escaped-bracket
+    spelling did not.
     """
     body = _render_block_nodes(_adf_children(cell))
     flattened = " ".join(part for part in body.split("\n") if part.strip())
+    flattened = _UNESCAPED_STATUS_LOZENGE_RE.sub(
+        lambda m: f"{{status:title={m.group('status_title')}}}", flattened
+    )
     return flattened.replace("|", "\\|").strip()
 
 

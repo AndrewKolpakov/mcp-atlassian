@@ -451,12 +451,25 @@ class TestInlineNodes:
         )
         assert adf_to_markdown(doc) == "😄"
 
-    def test_a_status_keeps_its_brackets_escaped(self) -> None:
-        """Unescaped, a status followed by parenthesised prose would re-parse as
-        a Markdown link."""
-        doc = _doc(_para({"type": "status", "attrs": {"text": "DONE"}}, _text("(x)")))
-        assert adf_to_markdown(doc) == "\\[DONE\\](x)"
+    def test_a_status_is_rendered_as_the_token_the_writer_parses(self) -> None:
+        """The escaped-bracket spelling read back as literal text, losing the
+        node; the token spelling comes back as a lozenge. Followed by
+        parenthesised prose it must still not re-parse as a Markdown link."""
+        doc = _doc(
+            _para(
+                {"type": "status", "attrs": {"text": "DONE", "color": "green"}},
+                _text("(x)"),
+            )
+        )
+        assert adf_to_markdown(doc) == "{status:color=green|title=DONE}(x)"
         assert "link" not in str(markdown_to_adf(_md(doc)))
+
+    def test_a_status_whose_title_would_break_the_token_falls_back(self) -> None:
+        """A ``}`` ends the token early, so the tail would be stranded. The
+        escaped-bracket form keeps the label as its own text instead."""
+        doc = _doc(_para({"type": "status", "attrs": {"text": "a}b"}}))
+        assert adf_to_markdown(doc) == "\\[a}b\\]"
+        assert "status" not in str(markdown_to_adf(_md(doc)))
 
     def test_an_inline_card_with_a_name_becomes_a_link(self) -> None:
         doc = _doc(
@@ -883,6 +896,152 @@ class TestFixedPoint:
                     walk(child)
 
         walk(rebuilt)
+
+
+def _statuses(node: Any) -> list[tuple[Any, Any]]:
+    """Every status node in a document, as (text, color) pairs."""
+    found: list[tuple[Any, Any]] = []
+    if isinstance(node, dict):
+        if node.get("type") == "status":
+            attrs = node.get("attrs") or {}
+            found.append((attrs.get("text"), attrs.get("color")))
+        for value in node.values():
+            found.extend(_statuses(value))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_statuses(item))
+    return found
+
+
+def _status(text: str, color: Any = None) -> dict[str, Any]:
+    attrs: dict[str, Any] = {"text": text, "style": ""}
+    if color is not None:
+        attrs["color"] = color
+    return {"type": "status", "attrs": attrs}
+
+
+class TestStatusRoundTrip:
+    """The reader and the writer must agree on the status lozenge.
+
+    Upstream #1624 taught ``markdown_to_adf`` to read
+    ``{status:color=X|title=Y}`` while the reader still emitted ``\\[Y\\]``.
+    That left the pair disagreeing in both directions: a real lozenge was lost
+    on the way out, and prose that merely contained the token was turned into a
+    lozenge on the way back in.
+    """
+
+    @pytest.mark.parametrize(
+        "color", ["neutral", "purple", "blue", "red", "yellow", "green"]
+    )
+    def test_a_lozenge_keeps_its_color_across_a_cycle(self, color: str) -> None:
+        doc = _doc(_para(_status("Done", color)))
+        assert _statuses(markdown_to_adf(_md(doc))) == [("Done", color)]
+
+    @pytest.mark.parametrize("color", ["lime", None, 42, "", "GREEN"])
+    def test_an_unusable_color_costs_the_color_not_the_lozenge(
+        self, color: Any
+    ) -> None:
+        """The writer coerces an unknown color to neutral, so the reader does
+        too rather than falling back and dropping the node."""
+        expected = "green" if color == "GREEN" else "neutral"
+        doc = _doc(_para(_status("Done", color)))
+        assert _statuses(markdown_to_adf(_md(doc))) == [("Done", expected)]
+
+    @pytest.mark.parametrize(
+        "title",
+        ["a|b", "color=red|title=x", "*bold* [x]", "snake_case", "a`b`c", "100%"],
+    )
+    def test_an_awkward_title_still_round_trips(self, title: str) -> None:
+        doc = _doc(_para(_status(title, "green")))
+        assert _statuses(markdown_to_adf(_md(doc))) == [(title, "green")]
+
+    @pytest.mark.parametrize("title", ["a}b", "", "a\nb"])
+    def test_a_title_the_token_cannot_carry_falls_back(self, title: str) -> None:
+        """Better a lost lozenge than a corrupted document: none of these may
+        produce a status node with the wrong label."""
+        doc = _doc(_para(_status(title, "green")))
+        assert _statuses(markdown_to_adf(_md(doc))) == []
+
+    @pytest.mark.parametrize(
+        "prose",
+        [
+            "config uses {status:title=Done} as a sentinel",
+            "see {status:color=green|title=Done} in the docs",
+            "plain {braces} and {status:nope} stay alone",
+        ],
+    )
+    def test_prose_that_looks_like_a_token_is_not_turned_into_a_lozenge(
+        self, prose: str
+    ) -> None:
+        """The regression the merge of upstream #1624 introduced: the writer
+        read a token the reader did not escape."""
+        doc = _doc(_para(_text(prose)))
+        back = markdown_to_adf(_md(doc))
+        assert _statuses(back) == []
+        assert back["content"][0]["content"] == [{"type": "text", "text": prose}]
+
+    def test_a_lozenge_in_a_table_cell_survives_without_its_color(self) -> None:
+        """The color form separates its fields with ``|``, which a cell escapes
+        as ``\\|`` -- a spelling the writer does not read. The title-only form
+        keeps the node, which the escaped-bracket spelling did not."""
+        doc = _doc(
+            {
+                "type": "table",
+                "content": [
+                    {
+                        "type": "tableRow",
+                        "content": [
+                            {"type": "tableHeader", "content": [_para(_text("h"))]}
+                        ],
+                    },
+                    {
+                        "type": "tableRow",
+                        "content": [
+                            {
+                                "type": "tableCell",
+                                "content": [_para(_status("Done", "green"))],
+                            }
+                        ],
+                    },
+                ],
+            }
+        )
+        assert "{status:title=Done}" in _md(doc)
+        assert _statuses(markdown_to_adf(_md(doc))) == [("Done", "neutral")]
+
+    def test_token_shaped_prose_in_a_cell_keeps_its_color_text(self) -> None:
+        """The cell drops a real lozenge's colour, but prose that merely looks
+        like one is escaped, not markup -- rewriting it would edit the author's
+        text, which is the corruption the escape exists to prevent."""
+        prose = "see {status:color=green|title=Done} in docs"
+        doc = _doc(
+            {
+                "type": "table",
+                "content": [
+                    {
+                        "type": "tableRow",
+                        "content": [
+                            {"type": "tableHeader", "content": [_para(_text("h"))]}
+                        ],
+                    },
+                    {
+                        "type": "tableRow",
+                        "content": [
+                            {"type": "tableCell", "content": [_para(_text(prose))]}
+                        ],
+                    },
+                ],
+            }
+        )
+        back = markdown_to_adf(_md(doc))
+        cell = back["content"][0]["content"][1]["content"][0]["content"][0]["content"]
+        assert "".join(node.get("text", "") for node in cell) == prose
+        assert _statuses(back) == []
+
+    def test_the_escape_only_fires_on_a_complete_token(self) -> None:
+        """Escaping every brace would add noise to JSON-ish prose."""
+        doc = _doc(_para(_text('{"a": 1} and {status:} and {status:title=x}')))
+        assert _md(doc) == '{"a": 1} and {status:} and \\{status:title=x}'
 
 
 class TestDegenerateInput:
