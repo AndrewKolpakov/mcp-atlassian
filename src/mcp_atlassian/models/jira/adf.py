@@ -57,6 +57,9 @@ _JIRA_ISSUE_KEY_RE = re.compile(
     r"([A-Z][A-Z0-9_]+-\d+(?:-\d+)*)"
     r"(?![A-Za-z0-9_/-])"
 )
+_VALID_STATUS_COLORS = frozenset(
+    {"neutral", "purple", "blue", "red", "yellow", "green"}
+)
 
 
 def _normalize_known_project_keys(
@@ -229,8 +232,9 @@ def _parse_inline_formatting(
     """Parse inline Markdown formatting into ADF inline nodes.
 
     Handles: bold (**), italic (*), inline code (`), links ([text](url)),
-    strikethrough (~~), and Jira-flavored user mentions
-    ([~accountid:ACCOUNT_ID] or @[Display Name](accountid:ACCOUNT_ID)).
+    strikethrough (~~), Jira-flavored user mentions
+    ([~accountid:ACCOUNT_ID] or @[Display Name](accountid:ACCOUNT_ID)), and
+    status lozenges ({status:color=green|title=Done}).
 
     Link text is parsed recursively, so inline markup inside it becomes
     nested marks instead of literal characters. Issue-key autolinking is left
@@ -246,6 +250,9 @@ def _parse_inline_formatting(
     are symmetric. The display-name syntax also includes the mention text in
     the ADF node.
 
+    The {status:...} syntax follows Jira wiki markup conventions. ``color`` is
+    optional and falls back to "neutral" when omitted or unrecognized.
+
     Args:
         text: Raw text potentially containing inline Markdown formatting.
         jira_base_url: Jira base URL used to link bare issue keys.
@@ -256,7 +263,8 @@ def _parse_inline_formatting(
     Returns:
         List of ADF inline nodes (text nodes with optional marks, plus
         mention nodes when [~accountid:...] or
-        @[Display Name](accountid:...) is present).
+        @[Display Name](accountid:...) is present, plus status nodes when
+        {status:...} is present).
     """
     if not text:
         return []
@@ -266,13 +274,16 @@ def _parse_inline_formatting(
     # win over the marker it protects), then mention before link, the triple
     # marker before bold (``***x***`` is bold *and* italic, and reading it as
     # bold-then-stray-asterisk would corrupt it), bold before italic, code
-    # before others.
+    # before others.  Status sits after code so a backticked ``{status:...}``
+    # stays literal.
     inline_re = re.compile(
         rf"\\(?P<escaped>[{_MD_ESCAPABLE_PUNCTUATION}])"
         r"|\[~accountid:(?P<wiki_mention_id>[^\]]+)\]"
         r"|@\[(?P<display_mention_text>[^\]]+)\]"
         r"\(accountid:(?P<display_mention_id>[^)]+)\)"
         r"|`(?P<code_inner>[^`]+)`"
+        r"|\{status:(?:color=(?P<status_color>\w+)\|)?"
+        r"title=(?P<status_title>[^}]+)\}"
         r"|\*\*\*(?P<bold_italic_inner>.+?)\*\*\*"
         r"|\*\*(?P<bold_inner>.+?)\*\*"
         r"|~~(?P<strike_inner>.+?)~~"
@@ -321,6 +332,20 @@ def _parse_inline_formatting(
                     "type": "text",
                     "text": m.group("code_inner"),
                     "marks": [{"type": "code"}],
+                }
+            )
+        elif m.group("status_title") is not None:
+            color = (m.group("status_color") or "neutral").lower()
+            if color not in _VALID_STATUS_COLORS:
+                color = "neutral"
+            nodes.append(
+                {
+                    "type": "status",
+                    "attrs": {
+                        "text": m.group("status_title"),
+                        "color": color,
+                        "style": "",
+                    },
                 }
             )
         elif m.group("bold_italic_inner") is not None:

@@ -932,6 +932,12 @@ class JiraPreprocessor(BasePreprocessor):
         # Jira's own renderer.  Both stop at the boundary of a scheme-ful URL,
         # so a link with underscores in its path stays clickable.  See
         # _BOLD_ITALIC_PATTERN and _URL_TOKEN_PATTERN.
+        #
+        # A delimiter preceded by a backslash is a wiki escape, not markup, and
+        # must neither open nor close a span (issue #1610 upstream, e.g. the
+        # intraword ``\_`` markdown_to_jira writes).  No lookbehind is needed
+        # here: _protect_escaped_chars above has already replaced every ``\c``
+        # escape with a placeholder, so the pattern never sees the delimiter.
         output = _sub_outside_urls(_BOLD_ITALIC_PATTERN, _wrap_bold_or_italic, output)
 
         # Multi-level numbered list
@@ -1102,9 +1108,12 @@ class JiraPreprocessor(BasePreprocessor):
         # markdown.
         output = _convert_fenced_blocks(output)
 
-        # Headers with = or - underlines
+        # Headers with = or - underlines. A setext heading needs actual text on
+        # the line above the underline, so the lookahead keeps a blank line from
+        # matching: `\n\n----\n` is a horizontal rule, which is already valid
+        # Jira markup, not an empty `h2.` (issue #1587).
         output = re.sub(
-            r"^(.*?)\n([=-])+$",
+            r"^(?=[^\n]*\S)(.*?)\n([=-])+$",
             lambda match: f"h{1 if match.group(2)[0] == '=' else 2}. {match.group(1)}",
             output,
             flags=re.MULTILINE,
