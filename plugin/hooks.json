@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__plugin_mcp-atlassian_atlassian__jira_create_issue|mcp__plugin_mcp-atlassian_atlassian__jira_update_issue|mcp__plugin_mcp-atlassian_atlassian__jira_add_comment|mcp__plugin_mcp-atlassian_atlassian__jira_edit_comment|mcp__plugin_mcp-atlassian_atlassian__jira_batch_create_issues|mcp__atlassian__jira_create_issue|mcp__atlassian__jira_update_issue|mcp__atlassian__jira_add_comment|mcp__atlassian__jira_edit_comment|mcp__atlassian__jira_batch_create_issues",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --frozen --project \"${CLAUDE_PLUGIN_ROOT}\" python \"${CLAUDE_PLUGIN_ROOT}/plugin/scripts/jira_adf_guard.py\"",
+            "timeout": 30,
+            "statusMessage": "Checking the Jira body for a code span inside bold"
+          }
+        ]
+      }
+    ]
+  }
+}

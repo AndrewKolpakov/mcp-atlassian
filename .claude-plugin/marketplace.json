@@ -1,0 +1,15 @@
+{
+  "$schema": "https://code.claude.com/schemas/marketplace.json",
+  "name": "local-atlassian",
+  "owner": {
+    "name": "Andrew Kolpakov"
+  },
+  "description": "Jira and Confluence over MCP. A fork of https://github.com/sooperset/mcp-atlassian, packaged as a Claude Code plugin.",
+  "plugins": [
+    {
+      "name": "mcp-atlassian",
+      "source": "./",
+      "description": "Jira and Confluence over MCP, with a round-tripping Markdown/ADF converter. Forked from https://github.com/sooperset/mcp-atlassian."
+    }
+  ]
+}

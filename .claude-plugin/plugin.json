@@ -1,0 +1,61 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "mcp-atlassian",
+  "displayName": "MCP Atlassian",
+  "version": "0.1.0",
+  "description": "Jira and Confluence tools over MCP, with a Markdown/ADF converter that round-trips: panels, quotes, expands, tables and status lozenges survive a read, edit and write back.",
+  "author": {
+    "name": "Andrew Kolpakov",
+    "email": "andrew.kolpakov@gmail.com"
+  },
+  "repository": "https://github.com/AndrewKolpakov/mcp-atlassian",
+  "license": "MIT",
+  "keywords": [
+    "jira",
+    "confluence",
+    "atlassian",
+    "adf",
+    "mcp"
+  ],
+  "userConfig": {
+    "jira_url": {
+      "type": "string",
+      "title": "Jira base URL",
+      "description": "e.g. https://your-company.atlassian.net \u2014 leave empty to disable Jira tools."
+    },
+    "jira_username": {
+      "type": "string",
+      "title": "Jira account email",
+      "description": "The email of the account the API token belongs to. Cloud only; leave empty when using a Server/DC personal access token."
+    },
+    "jira_api_token": {
+      "type": "string",
+      "title": "Jira API token",
+      "description": "Create one at id.atlassian.com/manage-profile/security/api-tokens. On Server/DC, use a personal access token instead.",
+      "sensitive": true
+    },
+    "confluence_url": {
+      "type": "string",
+      "title": "Confluence base URL",
+      "description": "e.g. https://your-company.atlassian.net/wiki \u2014 leave empty to disable Confluence tools."
+    },
+    "confluence_username": {
+      "type": "string",
+      "title": "Confluence account email",
+      "description": "Usually the same as the Jira account email."
+    },
+    "confluence_api_token": {
+      "type": "string",
+      "title": "Confluence API token",
+      "description": "The same token as Jira works on Atlassian Cloud.",
+      "sensitive": true
+    },
+    "server_source": {
+      "type": "directory",
+      "title": "Run from this checkout instead",
+      "description": "Optional. Point this at a clone of the repository to run that working tree rather than the copy shipped with the plugin \u2014 the dev loop. Equivalent to setting MCP_ATLASSIAN_SRC."
+    }
+  },
+  "skills": "./plugin/skills/",
+  "hooks": "./plugin/hooks.json"
+}
