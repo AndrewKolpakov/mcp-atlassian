@@ -103,6 +103,13 @@ directory, then the directory itself. So `[~/work/acme/api]` inherits
 past its parent to `[default]`, which would authenticate to one site with
 another site's credential.
 
+The same file also configures the companion
+[bitbucket-mcp plugin](https://github.com/AndrewKolpakov/bitbucket-mcp), which
+reads `BITBUCKET_WORKSPACE`, `BITBUCKET_USERNAME`, `BITBUCKET_PASSWORD`,
+`BITBUCKET_TOKEN` and `BITBUCKET_URL` from the same sections, layered by the same
+rules. This launcher ignores those keys, and that one ignores the Jira and
+Confluence ones.
+
 Every variable the server understands — proxies, SSL, toolset filtering,
 read-only mode — is listed in [`.env.example`](../.env.example). Set those in the
 environment; this file carries the credential variables.
