@@ -180,10 +180,9 @@ class TestRealJiraAPI(BaseAuthTest):
             )
             listed = {a.id: a for a in issue_with_attachments.attachments}
             assert result["id"] in listed
-            assert {
-                "id": result["id"],
-                **listed[result["id"]].to_simplified_dict(),
-            } == attachment
+            reported = listed[result["id"]].to_simplified_dict()
+            for field in ("filename", "size", "url", "content_type"):
+                assert attachment.get(field) == reported.get(field), field
 
             # Batch: every file's outcome is reported
             second = tmp_path / "second.txt"

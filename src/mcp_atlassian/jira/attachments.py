@@ -513,7 +513,14 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
         detail = _jira_error_detail(response)
         suffix = f": {detail}" if detail else "."
 
-        if status == 413 or _SIZE_ERROR_PATTERN.search(detail):
+        # 413 is always a size refusal. Some versions answer 400 instead, so a
+        # 400 counts only when its text is about size *and* states a byte
+        # count — "Field X exceeds 255 characters" must not read as one.
+        if status == 413 or (
+            status == 400
+            and _SIZE_ERROR_PATTERN.search(detail)
+            and _parse_size_limit(detail) is not None
+        ):
             limit = _parse_size_limit(detail)
             if limit is None:
                 limit = self._get_attachment_upload_limit()

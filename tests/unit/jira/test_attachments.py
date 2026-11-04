@@ -741,6 +741,41 @@ class TestAttachmentsMixin:
         assert message in result["error"]
         attachments_mixin.jira.get.assert_not_called()
 
+    def test_upload_attachment_size_limit_on_400(
+        self, attachments_mixin: AttachmentsMixin, workspace: Path
+    ):
+        """A 400 that states a byte limit is reported as a size refusal."""
+        (workspace / "big.bin").write_bytes(b"0" * 16)
+        attachments_mixin.jira.post.return_value = self._response(
+            400,
+            {
+                "errorMessages": [
+                    "The field file exceeds its maximum permitted size of 8 bytes."
+                ]
+            },
+        )
+
+        result = attachments_mixin.upload_attachment("TEST-1", "big.bin")
+
+        assert "limit of 8 bytes" in result["error"]
+
+    def test_upload_attachment_non_size_400_is_not_a_size_refusal(
+        self, attachments_mixin: AttachmentsMixin, workspace: Path
+    ):
+        """'exceeds' about something other than bytes is not a size limit."""
+        (workspace / "a.txt").write_bytes(b"x")
+        attachments_mixin.jira.post.return_value = self._response(
+            400, {"errorMessages": ["Field summary exceeds 255 characters."]}
+        )
+
+        result = attachments_mixin.upload_attachment("TEST-1", "a.txt")
+
+        assert "size limit" not in result["error"]
+        assert "limit of" not in result["error"]
+        assert "HTTP 400" in result["error"]
+        assert "Field summary exceeds 255 characters." in result["error"]
+        attachments_mixin.jira.get.assert_not_called()
+
     def test_upload_attachment_size_limit_from_meta_when_error_is_silent(
         self, attachments_mixin: AttachmentsMixin, workspace: Path
     ):
