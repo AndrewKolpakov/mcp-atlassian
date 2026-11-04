@@ -1,0 +1,7 @@
+examples:
+  - |
+    {"issue_key": "PROJ-123", "file_paths": "./a.pdf,./b.png"}
+  - |
+    {"issue_key": "PROJ-123", "file_paths": "[\"./notes, draft.txt\", \"./b.png\"]"}
+tips: |
+  Each file is attempted independently and reported once, under `uploaded` (with the created attachment's metadata) or `failed` (with the reason). `success` is true only when every file was uploaded; if none was, the call is a tool error carrying the full per-file report. Same path and size rules as `jira_upload_attachment`.

@@ -512,6 +512,8 @@ def test_jira_mcp(mock_jira_fetcher, mock_base_jira_config):
         update_proforma_form_answers,
         update_sprint,
         update_version,
+        upload_attachment,
+        upload_attachments,
     )
 
     jira_sub_mcp = FastMCP(name="TestJiraSubMCP")
@@ -540,6 +542,8 @@ def test_jira_mcp(mock_jira_fetcher, mock_base_jira_config):
     jira_sub_mcp.add_tool(get_worklog)
     jira_sub_mcp.add_tool(download_attachments)
     jira_sub_mcp.add_tool(get_issue_images)
+    jira_sub_mcp.add_tool(upload_attachment)
+    jira_sub_mcp.add_tool(upload_attachments)
     jira_sub_mcp.add_tool(get_field_options)
     jira_sub_mcp.add_tool(get_cross_project_dependencies)
     jira_sub_mcp.add_tool(get_proforma_form_details)
@@ -3323,6 +3327,284 @@ async def test_get_issue_images_fetch_failure(jira_client, mock_jira_fetcher):
     assert summary["downloaded"] == 0
     assert len(summary["failed"]) == 1
     assert "Fetch failed" in summary["failed"][0]["error"]
+
+
+# --- Tests for jira_upload_attachment / jira_upload_attachments ---
+
+_UPLOADED_ATTACHMENT = {
+    "id": "10001",
+    "filename": "report.pdf",
+    "size": 2048,
+    "url": "https://test.atlassian.net/secure/attachment/10001/report.pdf",
+    "content_type": "application/pdf",
+}
+
+
+@pytest.mark.anyio
+async def test_upload_attachment_returns_attachment_metadata(
+    jira_client, mock_jira_fetcher
+):
+    """The single-file tool returns the created attachment's metadata."""
+    mock_jira_fetcher.upload_attachment.return_value = {
+        "success": True,
+        "issue_key": "TEST-123",
+        "filename": "report.pdf",
+        "size": 2048,
+        "id": "10001",
+        "attachment": _UPLOADED_ATTACHMENT,
+    }
+
+    response = await jira_client.call_tool(
+        "jira_upload_attachment",
+        {"issue_key": "TEST-123", "file_path": "./report.pdf"},
+    )
+
+    mock_jira_fetcher.upload_attachment.assert_called_once_with(
+        "TEST-123", "./report.pdf"
+    )
+    body = json.loads(response.content[0].text)
+    assert body["issue_key"] == "TEST-123"
+    assert body["attachment"] == _UPLOADED_ATTACHMENT
+
+
+@pytest.mark.anyio
+async def test_upload_attachment_failure_is_tool_error(jira_client, mock_jira_fetcher):
+    """A refused upload surfaces as a tool error carrying the reason."""
+    mock_jira_fetcher.upload_attachment.return_value = {
+        "success": False,
+        "file_path": "../secret.txt",
+        "filename": "secret.txt",
+        "error": "Refusing to upload '../secret.txt': it resolves outside the "
+        "allowed root /ws (the server's working directory).",
+    }
+
+    with pytest.raises(ToolError) as exc_info:
+        await jira_client.call_tool(
+            "jira_upload_attachment",
+            {"issue_key": "TEST-123", "file_path": "../secret.txt"},
+        )
+
+    assert "outside the allowed root" in str(exc_info.value)
+
+
+@pytest.mark.anyio
+async def test_upload_attachment_rejects_invalid_issue_key(
+    jira_client, mock_jira_fetcher
+):
+    """The issue key is validated before the fetcher is touched."""
+    with pytest.raises(ToolError):
+        await jira_client.call_tool(
+            "jira_upload_attachment",
+            {"issue_key": "not a key", "file_path": "./a.txt"},
+        )
+    mock_jira_fetcher.upload_attachment.assert_not_called()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("file_paths", "expected"),
+    [
+        ('["./a, b.txt", "./c.txt"]', ["./a, b.txt", "./c.txt"]),
+        ("./a.txt, ./c.txt", ["./a.txt", "./c.txt"]),
+    ],
+)
+async def test_upload_attachments_reports_every_file(
+    jira_client, mock_jira_fetcher, file_paths, expected
+):
+    """The batch tool passes every path and reports each outcome."""
+    mock_jira_fetcher.upload_attachments.return_value = {
+        "success": True,
+        "issue_key": "TEST-123",
+        "total": 2,
+        "uploaded": [
+            {
+                "file_path": expected[0],
+                "filename": "a.txt",
+                "size": 1,
+                "id": "1",
+                "attachment": {"id": "1", "filename": "a.txt"},
+            }
+        ],
+        "failed": [
+            {
+                "file_path": expected[1],
+                "filename": "c.txt",
+                "error": "File not found: /ws/c.txt",
+            }
+        ],
+    }
+
+    response = await jira_client.call_tool(
+        "jira_upload_attachments",
+        {"issue_key": "TEST-123", "file_paths": file_paths},
+    )
+
+    mock_jira_fetcher.upload_attachments.assert_called_once_with("TEST-123", expected)
+    body = json.loads(response.content[0].text)
+    assert body["success"] is False
+    assert body["total"] == 2
+    assert body["uploaded"] == [
+        {"file_path": expected[0], "attachment": {"id": "1", "filename": "a.txt"}}
+    ]
+    assert body["failed"][0]["file_path"] == expected[1]
+    assert "File not found" in body["failed"][0]["error"]
+    assert "1 failed" in body["message"]
+
+
+@pytest.mark.anyio
+async def test_upload_attachments_all_succeeded(jira_client, mock_jira_fetcher):
+    """success is true only when every file was uploaded."""
+    mock_jira_fetcher.upload_attachments.return_value = {
+        "success": True,
+        "issue_key": "TEST-123",
+        "total": 1,
+        "uploaded": [{"file_path": "./a.txt", "attachment": {"id": "1"}}],
+        "failed": [],
+    }
+
+    response = await jira_client.call_tool(
+        "jira_upload_attachments",
+        {"issue_key": "TEST-123", "file_paths": "./a.txt"},
+    )
+
+    body = json.loads(response.content[0].text)
+    assert body["success"] is True
+    assert body["failed"] == []
+
+
+@pytest.mark.anyio
+async def test_upload_attachments_none_uploaded_is_tool_error_with_report(
+    jira_client, mock_jira_fetcher
+):
+    """When nothing was uploaded the error still lists every file's reason."""
+    mock_jira_fetcher.upload_attachments.return_value = {
+        "success": False,
+        "issue_key": "TEST-123",
+        "total": 2,
+        "uploaded": [],
+        "failed": [
+            {"file_path": "./a.txt", "filename": "a.txt", "error": "HTTP 403 a"},
+            {"file_path": "./b.txt", "filename": "b.txt", "error": "HTTP 413 b"},
+        ],
+    }
+
+    with pytest.raises(ToolError) as exc_info:
+        await jira_client.call_tool(
+            "jira_upload_attachments",
+            {"issue_key": "TEST-123", "file_paths": "./a.txt,./b.txt"},
+        )
+
+    message = str(exc_info.value)
+    assert "No file was uploaded" in message
+    assert "HTTP 403 a" in message
+    assert "HTTP 413 b" in message
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("file_paths", ["", " , ", "[]"])
+async def test_upload_attachments_requires_a_path(
+    jira_client, mock_jira_fetcher, file_paths
+):
+    """An empty path list is refused without calling the fetcher."""
+    with pytest.raises(ToolError, match="at least one file"):
+        await jira_client.call_tool(
+            "jira_upload_attachments",
+            {"issue_key": "TEST-123", "file_paths": file_paths},
+        )
+    mock_jira_fetcher.upload_attachments.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_upload_attachments_rejects_non_array_json(
+    jira_client, mock_jira_fetcher
+):
+    """A JSON value that is not an array is refused."""
+    with pytest.raises(ToolError, match="must be an array"):
+        await jira_client.call_tool(
+            "jira_upload_attachments",
+            {"issue_key": "TEST-123", "file_paths": '{"a": 1}'},
+        )
+    mock_jira_fetcher.upload_attachments.assert_not_called()
+
+
+_READ_ONLY_UPLOAD_CASES = [
+    ("jira_upload_attachment", {"issue_key": "TEST-1", "file_path": "./a.txt"}),
+    ("jira_upload_attachments", {"issue_key": "TEST-1", "file_paths": "./a.txt"}),
+]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("tool_name", "arguments"), _READ_ONLY_UPLOAD_CASES)
+async def test_upload_tools_hidden_in_read_only_mode(
+    mock_jira_fetcher, mock_base_jira_config, mock_request, tool_name, arguments
+):
+    """Read-only mode hides the upload tools and they never reach the fetcher."""
+    from src.mcp_atlassian.servers.jira import upload_attachment, upload_attachments
+
+    @asynccontextmanager
+    async def read_only_lifespan(app: FastMCP) -> AsyncGenerator[dict, None]:
+        yield {
+            "app_lifespan_context": MainAppContext(
+                full_jira_config=mock_base_jira_config, read_only=True
+            )
+        }
+
+    test_mcp = AtlassianMCP("ReadOnlyJira", lifespan=read_only_lifespan)
+    sub_mcp = FastMCP(name="ReadOnlyJiraSub")
+    sub_mcp.add_tool(upload_attachment)
+    sub_mcp.add_tool(upload_attachments)
+    test_mcp.mount(sub_mcp, namespace="jira")
+
+    with (
+        patch(
+            "src.mcp_atlassian.servers.jira.get_jira_fetcher",
+            AsyncMock(return_value=mock_jira_fetcher),
+        ),
+        patch(
+            "src.mcp_atlassian.servers.dependencies.get_http_request",
+            return_value=mock_request,
+        ),
+    ):
+        async with Client(transport=FastMCPTransport(test_mcp)) as client:
+            listed = {tool.name for tool in await client.list_tools()}
+            with pytest.raises(ToolError):
+                await client.call_tool(tool_name, arguments)
+
+    assert tool_name not in listed
+    mock_jira_fetcher.upload_attachment.assert_not_called()
+    mock_jira_fetcher.upload_attachments.assert_not_called()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("tool_name", "arguments"), _READ_ONLY_UPLOAD_CASES)
+async def test_upload_tools_refuse_execution_in_read_only_mode(
+    mock_jira_fetcher, mock_base_jira_config, tool_name, arguments
+):
+    """check_write_access refuses even if the listing filter were bypassed."""
+    from src.mcp_atlassian.servers import jira as jira_server
+
+    tool = {
+        "jira_upload_attachment": jira_server.upload_attachment,
+        "jira_upload_attachments": jira_server.upload_attachments,
+    }[tool_name]
+    ctx = MagicMock()
+    ctx.request_context.lifespan_context = {
+        "app_lifespan_context": MainAppContext(
+            full_jira_config=mock_base_jira_config, read_only=True
+        )
+    }
+
+    with (
+        patch(
+            "src.mcp_atlassian.servers.jira.get_jira_fetcher",
+            AsyncMock(return_value=mock_jira_fetcher),
+        ),
+        pytest.raises(ToolError, match="read-only mode"),
+    ):
+        await tool(ctx, **arguments)
+
+    mock_jira_fetcher.upload_attachment.assert_not_called()
+    mock_jira_fetcher.upload_attachments.assert_not_called()
 
 
 # --- Tests for input/output parameter name alignment ---

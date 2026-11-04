@@ -1,6 +1,6 @@
 ---
 title: "Jira Attachments"
-description: "Download attachments and render issue images"
+description: "Download and upload attachments, render issue images"
 ---
 
 ### Download Attachments
@@ -20,6 +20,58 @@ Download attachments from a Jira issue.
 
 <Tip>
 Downloads all attachments from the issue. Files larger than 50MB are skipped. Returns base64-encoded content.
+</Tip>
+
+---
+
+### Upload Attachment
+
+Upload a file as an attachment to a Jira issue.
+
+<Note>This is a **write** tool. Disabled when `READ_ONLY_MODE=true`.</Note>
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `issue_key` | `string` | Yes | Jira issue key (e.g., 'PROJ-123', 'ACV2-642') |
+| `file_path` | `string` | Yes | Path of the file to attach, absolute or relative to the server's working directory (e.g., './reports/summary.pdf'). The file must resolve inside the server's working directory; paths outside it are refused. |
+**Example:**
+
+```json
+{"issue_key": "PROJ-123", "file_path": "./reports/summary.pdf"}
+```
+
+<Tip>
+The path must resolve, symlinks included, inside the server's working directory; anything outside it is refused. Jira's own size limit and permissions apply, and a refusal is a tool error naming the cause (outside the allowed root, file not found, over the instance's size limit as Jira reports it, no permission to attach to the issue). Returns the created attachment in the same shape as attachments in `jira_get_issue`, plus its `id`.
+</Tip>
+
+---
+
+### Upload Attachments
+
+Upload several files as attachments to a Jira issue.
+
+<Note>This is a **write** tool. Disabled when `READ_ONLY_MODE=true`.</Note>
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `issue_key` | `string` | Yes | Jira issue key (e.g., 'PROJ-123', 'ACV2-642') |
+| `file_paths` | `string` | Yes | Files to attach: a JSON array of paths (e.g., '["./a.pdf", "./b.png"]') or a comma-separated list (e.g., './a.pdf,./b.png'). Use the JSON form when a path contains a comma. Each path must resolve inside the server's working directory. |
+**Examples:**
+
+```json
+{"issue_key": "PROJ-123", "file_paths": "./a.pdf,./b.png"}
+```
+
+```json
+{"issue_key": "PROJ-123", "file_paths": "[\"./notes, draft.txt\", \"./b.png\"]"}
+```
+
+<Tip>
+Each file is attempted independently and reported once, under `uploaded` (with the created attachment's metadata) or `failed` (with the reason). `success` is true only when every file was uploaded; if none was, the call is a tool error carrying the full per-file report. Same path and size rules as `jira_upload_attachment`.
 </Tip>
 
 ---

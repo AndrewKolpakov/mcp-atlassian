@@ -233,6 +233,29 @@ def _parse_request_participants(
     )
 
 
+def _parse_file_paths(value: str, param_name: str) -> list[str]:
+    """Parse a list of file paths given as a JSON array or comma-separated string.
+
+    Args:
+        value: A JSON array string (e.g. '["a.txt", "b.txt"]') or a
+            comma-separated string (e.g. 'a.txt,b.txt').
+        param_name: Name of the tool parameter, used in error messages.
+
+    Returns:
+        The non-empty paths, in the order given.
+
+    Raises:
+        ValueError: If the value is valid JSON but not an array.
+    """
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return [p.strip() for p in value.split(",") if p.strip()]
+    if not isinstance(parsed, list):
+        raise ValueError(f"{param_name} JSON string must be an array.")
+    return [str(p) for p in parsed]
+
+
 def _parse_attachments(
     attachments: str | list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]] | None:
@@ -1330,6 +1353,149 @@ async def download_attachments(
 
 
 @jira_mcp.tool(
+    tags={"jira", "write", "toolset:jira_attachments"},
+    annotations={"title": "Upload Attachment", "destructiveHint": False},
+)
+@check_write_access
+async def upload_attachment(
+    ctx: Context,
+    issue_key: Annotated[
+        str,
+        Field(
+            description="Jira issue key (e.g., 'PROJ-123', 'ACV2-642')",
+            pattern=ISSUE_KEY_PATTERN,
+        ),
+    ],
+    file_path: Annotated[
+        str,
+        Field(
+            description=(
+                "Path of the file to attach, absolute or relative to the server's "
+                "working directory (e.g., './reports/summary.pdf'). The file must "
+                "resolve inside the server's working directory; paths outside it "
+                "are refused."
+            ),
+        ),
+    ],
+) -> str:
+    """Upload a file as an attachment to a Jira issue.
+
+    The file is read by the server, so it must be reachable on the server's
+    filesystem and resolve (symlinks included) inside its working directory.
+    Jira's own size limit and permissions apply; a refusal is reported as a
+    tool error that names the cause.
+
+    Args:
+        ctx: The FastMCP context.
+        issue_key: Jira issue key.
+        file_path: Path of the file to upload.
+
+    Returns:
+        JSON string with the created attachment's metadata (id, filename, size,
+        content_type, url), in the same shape attachments have in
+        ``jira_get_issue``.
+
+    Raises:
+        ValueError: If the file is refused or Jira rejects the upload.
+    """
+    jira = await get_jira_fetcher(ctx)
+    result = await run_jira_fetcher_call(jira.upload_attachment, issue_key, file_path)
+    if not result.get("success"):
+        raise ValueError(
+            f"Upload of '{file_path}' to {issue_key} failed: "
+            f"{result.get('error') or 'unknown error'}"
+        )
+    return json.dumps(
+        {
+            "message": "Attachment uploaded successfully",
+            "issue_key": issue_key,
+            "attachment": result.get("attachment"),
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
+
+
+@jira_mcp.tool(
+    tags={"jira", "write", "toolset:jira_attachments"},
+    annotations={"title": "Upload Attachments", "destructiveHint": False},
+)
+@check_write_access
+async def upload_attachments(
+    ctx: Context,
+    issue_key: Annotated[
+        str,
+        Field(
+            description="Jira issue key (e.g., 'PROJ-123', 'ACV2-642')",
+            pattern=ISSUE_KEY_PATTERN,
+        ),
+    ],
+    file_paths: Annotated[
+        str,
+        Field(
+            description=(
+                "Files to attach: a JSON array of paths (e.g., "
+                '\'["./a.pdf", "./b.png"]\') or a comma-separated list (e.g., '
+                "'./a.pdf,./b.png'). Use the JSON form when a path contains a "
+                "comma. Each path must resolve inside the server's working "
+                "directory."
+            ),
+        ),
+    ],
+) -> str:
+    """Upload several files as attachments to a Jira issue.
+
+    Every file is attempted independently and reported individually: each path
+    appears exactly once, either under ``uploaded`` (with the created
+    attachment's metadata) or under ``failed`` (with the reason). If no file
+    could be uploaded the call is a tool error whose message carries the full
+    per-file report.
+
+    Args:
+        ctx: The FastMCP context.
+        issue_key: Jira issue key.
+        file_paths: JSON array or comma-separated list of file paths.
+
+    Returns:
+        JSON string with ``success`` (true only if every file was uploaded),
+        ``total``, ``uploaded`` and ``failed``.
+
+    Raises:
+        ValueError: If file_paths is empty or malformed, or no file was uploaded.
+    """
+    paths = _parse_file_paths(file_paths, "file_paths")
+    if not paths:
+        raise ValueError("file_paths must name at least one file.")
+
+    jira = await get_jira_fetcher(ctx)
+    result = await run_jira_fetcher_call(jira.upload_attachments, issue_key, paths)
+
+    uploaded = result.get("uploaded", [])
+    failed = result.get("failed", [])
+    report = {
+        "success": not failed and bool(uploaded),
+        "message": (
+            f"Uploaded {len(uploaded)} of {len(paths)} file(s) to {issue_key}"
+            + (f"; {len(failed)} failed" if failed else "")
+        ),
+        "issue_key": issue_key,
+        "total": len(paths),
+        "uploaded": [
+            {"file_path": item.get("file_path"), "attachment": item.get("attachment")}
+            for item in uploaded
+        ],
+        "failed": failed,
+    }
+    if not uploaded:
+        if not failed and result.get("error"):
+            raise ValueError(result["error"])
+        raise ValueError(
+            "No file was uploaded: " + json.dumps(report, indent=2, ensure_ascii=False)
+        )
+    return json.dumps(report, indent=2, ensure_ascii=False)
+
+
+@jira_mcp.tool(
     tags={"jira", "read", "attachments", "toolset:jira_attachments"},
     annotations={"title": "Get Issue Images", "readOnlyHint": True},
 )
@@ -2156,17 +2322,7 @@ async def update_issue(
     attachment_paths = []
     if attachments:
         if isinstance(attachments, str):
-            try:
-                parsed = json.loads(attachments)
-                if isinstance(parsed, list):
-                    attachment_paths = [str(p) for p in parsed]
-                else:
-                    raise ValueError("attachments JSON string must be an array.")
-            except json.JSONDecodeError:
-                # Assume comma-separated if not valid JSON array
-                attachment_paths = [
-                    p.strip() for p in attachments.split(",") if p.strip()
-                ]
+            attachment_paths = _parse_file_paths(attachments, "attachments")
         else:
             raise ValueError(
                 "attachments must be a JSON array string or comma-separated string."

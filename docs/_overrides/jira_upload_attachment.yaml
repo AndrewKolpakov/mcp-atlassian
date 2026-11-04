@@ -1,0 +1,4 @@
+example: |
+  {"issue_key": "PROJ-123", "file_path": "./reports/summary.pdf"}
+tips: |
+  The path must resolve, symlinks included, inside the server's working directory; anything outside it is refused. Jira's own size limit and permissions apply, and a refusal is a tool error naming the cause (outside the allowed root, file not found, over the instance's size limit as Jira reports it, no permission to attach to the issue). Returns the created attachment in the same shape as attachments in `jira_get_issue`, plus its `id`.

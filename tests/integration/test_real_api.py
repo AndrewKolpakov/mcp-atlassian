@@ -142,7 +142,7 @@ class TestRealJiraAPI(BaseAuthTest):
                     pass
 
     def test_attachment_upload_download(
-        self, jira_client, test_project_key, created_issues, tmp_path
+        self, jira_client, test_project_key, created_issues, tmp_path, monkeypatch
     ):
         """Test attachment upload and download flow."""
         # Create test issue
@@ -155,7 +155,9 @@ class TestRealJiraAPI(BaseAuthTest):
         created_issues.append(issue.key)
 
         try:
-            # Create test file
+            # Uploads may only read inside the working directory, so the
+            # temporary directory stands in for it.
+            monkeypatch.chdir(tmp_path)
             test_file = tmp_path / "test_attachment.txt"
             test_file.write_text(f"Test content {unique_id}")
 
@@ -163,17 +165,37 @@ class TestRealJiraAPI(BaseAuthTest):
             result = jira_client.upload_attachment(
                 issue_key=issue.key, file_path=str(test_file)
             )
-            assert result["success"]
+            assert result["success"], result
             assert result["filename"] == "test_attachment.txt"
+            # Jira answers with a JSON array; the id must come out of it.
+            assert result["id"]
+            attachment = result["attachment"]
+            assert attachment["id"] == result["id"]
+            assert attachment["size"] == test_file.stat().st_size
+            assert attachment["url"]
 
-            # Get issue with attachments
+            # The created attachment is what jira_get_issue reports
             issue_with_attachments = jira_client.get_issue(
                 issue_key=issue.key, fields="attachment"
             )
-            assert any(
-                a.filename == "test_attachment.txt"
-                for a in issue_with_attachments.attachments
+            listed = {a.id: a for a in issue_with_attachments.attachments}
+            assert result["id"] in listed
+            assert {
+                "id": result["id"],
+                **listed[result["id"]].to_simplified_dict(),
+            } == attachment
+
+            # Batch: every file's outcome is reported
+            second = tmp_path / "second.txt"
+            second.write_text("second")
+            batch = jira_client.upload_attachments(
+                issue_key=issue.key, file_paths=["second.txt", "missing.txt"]
             )
+            assert batch["total"] == 2
+            assert [u["file_path"] for u in batch["uploaded"]] == ["second.txt"]
+            assert batch["uploaded"][0]["id"]
+            assert [f["file_path"] for f in batch["failed"]] == ["missing.txt"]
+            assert "File not found" in batch["failed"][0]["error"]
 
         finally:
             # Cleanup

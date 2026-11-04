@@ -3,8 +3,12 @@
 import logging
 import mimetypes
 import os
+import re
+import urllib.parse
 from pathlib import Path
 from typing import Any
+
+import requests
 
 from ..models.jira import JiraAttachment
 from ..utils.io import validate_safe_path
@@ -362,15 +366,29 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
         }
 
     def upload_attachment(self, issue_key: str, file_path: str) -> dict[str, Any]:
-        """
-        Upload a single attachment to a Jira issue.
+        """Upload a single file as an attachment to a Jira issue.
+
+        Sends ``POST /rest/api/{2|3}/issue/{key}/attachments`` (multipart field
+        ``file``, header ``X-Atlassian-Token: no-check``) through the already
+        authenticated client, so Cloud and Server/DC share the code path; v3 is
+        used on Cloud and v2 on Server/DC, matching how issues are read.
+
+        The file must resolve, symlinks included, inside the server's working
+        directory: that is the only filesystem root an upload may read from.
+        Every refusal is returned as ``success: False`` with an ``error`` that
+        says why, rather than raised.
 
         Args:
-            issue_key: The Jira issue key (e.g., 'PROJ-123')
-            file_path: The path to the file to upload
+            issue_key: The Jira issue key (e.g., 'PROJ-123').
+            file_path: Path of the file to upload, absolute or relative to the
+                server's working directory.
 
         Returns:
-            A dictionary with upload result information
+            On success: ``success``, ``issue_key``, ``file_path``, ``filename``,
+            ``size``, ``id`` and ``attachment`` (the created attachment as a
+            simplified ``JiraAttachment`` plus its ``id``). On failure:
+            ``success: False``, ``file_path``, ``filename``, ``error`` and, when
+            Jira answered, ``status_code``.
         """
         if not issue_key:
             logger.error("No issue key provided for attachment upload")
@@ -380,64 +398,186 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
             logger.error("No file path provided for attachment upload")
             return {"success": False, "error": "No file path provided"}
 
+        filename = Path(file_path).name
+        failure: dict[str, Any] = {
+            "success": False,
+            "file_path": file_path,
+            "filename": filename,
+        }
+
+        # Confine the upload source to the workspace before anything about the
+        # file is looked at: a path that escapes CWD (traversal, absolute path,
+        # symlink) must be refused without revealing whether it exists.
         try:
-            # Confine the upload source to the workspace before it is read: reject
-            # traversal/absolute paths that escape CWD (arbitrary file read /
-            # exfiltration via a caller-supplied file_path).
-            file_path = str(validate_safe_path(file_path))
+            resolved = validate_safe_path(Path(file_path).expanduser())
+        except ValueError:
+            root = Path(os.getcwd()).resolve()
+            logger.error(f"Refusing to upload from outside {root}: {file_path}")
+            failure["error"] = (
+                f"Refusing to upload '{file_path}': it resolves outside the "
+                f"allowed root {root} (the server's working directory)."
+            )
+            return failure
 
-            # Check if file exists
-            if not os.path.exists(file_path):
-                logger.error(f"File not found: {file_path}")
-                return {"success": False, "error": f"File not found: {file_path}"}
+        if not resolved.exists():
+            logger.error(f"File not found: {resolved}")
+            failure["error"] = f"File not found: {resolved}"
+            return failure
 
-            logger.info(f"Uploading attachment from {file_path} to issue {issue_key}")
+        if not resolved.is_file():
+            logger.error(f"Not a regular file: {resolved}")
+            failure["error"] = f"Not a regular file: {resolved}"
+            return failure
 
-            # Use the Jira API to upload the file
-            filename = os.path.basename(file_path)
-            with open(file_path, "rb") as file:
-                attachment = self.jira.add_attachment(
-                    issue_key=issue_key, filename=file_path
+        filename = resolved.name
+        failure["filename"] = filename
+        mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        # Same API version the issue is read with (v3 on Cloud, v2 on
+        # Server/DC), so the returned content URL matches jira_get_issue's.
+        url = self.jira.resource_url(
+            f"issue/{urllib.parse.quote(issue_key, safe='')}/attachments",
+            api_version="3" if self.config.is_cloud else None,
+        )
+
+        logger.info(f"Uploading attachment {resolved} to issue {issue_key}")
+        try:
+            with resolved.open("rb") as file_handle:
+                response = self.jira.post(
+                    url,
+                    headers={"X-Atlassian-Token": "no-check"},
+                    files={"file": (filename, file_handle, mime_type)},
+                    advanced_mode=True,
                 )
+        except OSError as e:
+            logger.error(f"Could not read {resolved}: {e}")
+            failure["error"] = f"Could not read {resolved}: {e}"
+            return failure
+        except requests.RequestException as e:
+            logger.error(f"Error uploading attachment to {issue_key}: {e}")
+            failure["error"] = f"Upload request failed: {e}"
+            return failure
 
-            if attachment:
-                file_size = os.path.getsize(file_path)
-                logger.info(
-                    f"Successfully uploaded attachment {filename} to {issue_key} (size: {file_size} bytes)"
-                )
-                return {
-                    "success": True,
-                    "issue_key": issue_key,
-                    "filename": filename,
-                    "size": file_size,
-                    "id": attachment.get("id")
-                    if isinstance(attachment, dict)
-                    else None,
-                }
-            else:
-                logger.error(f"Failed to upload attachment {filename} to {issue_key}")
-                return {
-                    "success": False,
-                    "error": f"Failed to upload attachment {filename} to {issue_key}",
-                }
+        status = response.status_code
+        if status >= 400:
+            failure["status_code"] = status
+            failure["error"] = self._describe_upload_error(
+                response, issue_key, filename
+            )
+            logger.error(f"Upload of {filename} to {issue_key} failed: {failure}")
+            return failure
 
-        except Exception as e:
-            error_msg = str(e)
-            logger.error(f"Error uploading attachment: {error_msg}")
-            return {"success": False, "error": error_msg}
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        # Jira answers with a JSON array holding one entry per uploaded file.
+        item = body[0] if isinstance(body, list) and body else body
+        if not isinstance(item, dict) or not item.get("id"):
+            failure["status_code"] = status
+            failure["error"] = (
+                f"Jira accepted the upload of '{filename}' to {issue_key} "
+                f"(HTTP {status}) but returned no attachment metadata."
+            )
+            logger.error(failure["error"])
+            return failure
+
+        attachment = JiraAttachment.from_api_response(item)
+        logger.info(
+            f"Uploaded attachment {attachment.filename} (id {attachment.id}) "
+            f"to {issue_key} (size: {attachment.size} bytes)"
+        )
+        return {
+            "success": True,
+            "issue_key": issue_key,
+            "file_path": str(resolved),
+            "filename": attachment.filename or filename,
+            "size": attachment.size,
+            "id": attachment.id,
+            "attachment": {"id": attachment.id, **attachment.to_simplified_dict()},
+        }
+
+    def _describe_upload_error(
+        self, response: requests.Response, issue_key: str, filename: str
+    ) -> str:
+        """Turn a failed attachment-upload response into an actionable message.
+
+        Args:
+            response: The HTTP response Jira returned (status >= 400).
+            issue_key: The issue the upload targeted.
+            filename: The name of the file that was sent.
+
+        Returns:
+            A message naming the cause and carrying Jira's own wording.
+        """
+        status = response.status_code
+        detail = _jira_error_detail(response)
+        suffix = f": {detail}" if detail else "."
+
+        if status == 413 or _SIZE_ERROR_PATTERN.search(detail):
+            limit = _parse_size_limit(detail)
+            if limit is None:
+                limit = self._get_attachment_upload_limit()
+            limit_text = (
+                f"the instance's limit of {limit} bytes"
+                if limit is not None
+                else "the instance's attachment size limit"
+            )
+            return (
+                f"'{filename}' exceeds {limit_text}; Jira rejected it "
+                f"(HTTP {status}){suffix}"
+            )
+        if status == 401:
+            return f"Jira rejected the credentials (HTTP 401){suffix}"
+        if status == 403:
+            return (
+                f"This token may not add attachments to {issue_key}: it lacks "
+                "the Create Attachments permission on the issue, or "
+                f"attachments are disabled (HTTP 403){suffix}"
+            )
+        if status == 404:
+            return (
+                f"Issue {issue_key} does not exist or is not visible to this "
+                f"token (HTTP 404){suffix}"
+            )
+        return f"Jira rejected the upload of '{filename}' (HTTP {status}){suffix}"
+
+    def _get_attachment_upload_limit(self) -> int | None:
+        """Ask Jira for its attachment size limit (``GET attachment/meta``).
+
+        Used only when a size rejection does not state the limit itself.
+
+        Returns:
+            The limit in bytes, or None when it cannot be determined.
+        """
+        try:
+            meta = self.jira.get(self.jira.resource_url("attachment/meta"))
+        except (requests.RequestException, ValueError) as e:
+            logger.debug(f"Could not read the attachment upload limit: {e}")
+            return None
+        if isinstance(meta, dict):
+            limit = meta.get("uploadLimit")
+            if isinstance(limit, int) and not isinstance(limit, bool):
+                return limit
+        return None
 
     def upload_attachments(
         self, issue_key: str, file_paths: list[str]
     ) -> dict[str, Any]:
-        """
-        Upload multiple attachments to a Jira issue.
+        """Upload several files to a Jira issue, reporting every file's outcome.
+
+        Each file is uploaded independently; one failure does not stop the
+        rest. Every input path appears exactly once, in ``uploaded`` or in
+        ``failed``.
 
         Args:
-            issue_key: The Jira issue key (e.g., 'PROJ-123')
-            file_paths: List of paths to files to upload
+            issue_key: The Jira issue key (e.g., 'PROJ-123').
+            file_paths: Paths of the files to upload.
 
         Returns:
-            A dictionary with upload results
+            ``success`` (True when at least one file was uploaded),
+            ``issue_key``, ``total``, ``uploaded`` (``file_path``,
+            ``filename``, ``size``, ``id``, ``attachment``) and ``failed``
+            (``file_path``, ``filename``, ``error``, optional ``status_code``).
         """
         if not issue_key:
             logger.error("No issue key provided for attachment upload")
@@ -449,28 +589,35 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
 
         logger.info(f"Uploading {len(file_paths)} attachments to issue {issue_key}")
 
-        # Upload each attachment
-        uploaded = []
-        failed = []
+        uploaded: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
 
         for file_path in file_paths:
-            result = self.upload_attachment(issue_key, file_path)
+            try:
+                result = self.upload_attachment(issue_key, file_path)
+            except Exception as e:  # noqa: BLE001 - report every file's outcome
+                logger.error(f"Unexpected error uploading {file_path}: {e}")
+                result = {"success": False, "error": f"{type(e).__name__}: {e}"}
 
             if result.get("success"):
                 uploaded.append(
                     {
+                        "file_path": file_path,
                         "filename": result.get("filename"),
                         "size": result.get("size"),
                         "id": result.get("id"),
+                        "attachment": result.get("attachment"),
                     }
                 )
             else:
-                failed.append(
-                    {
-                        "filename": os.path.basename(file_path),
-                        "error": result.get("error"),
-                    }
-                )
+                entry: dict[str, Any] = {
+                    "file_path": file_path,
+                    "filename": os.path.basename(file_path),
+                    "error": result.get("error") or "Upload failed",
+                }
+                if "status_code" in result:
+                    entry["status_code"] = result["status_code"]
+                failed.append(entry)
 
         return {
             "success": bool(uploaded),
@@ -479,3 +626,57 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
             "uploaded": uploaded,
             "failed": failed,
         }
+
+
+_SIZE_ERROR_PATTERN = re.compile(
+    r"maximum permitted size|exceeds|too large", re.IGNORECASE
+)
+_SIZE_LIMIT_PATTERN = re.compile(r"(\d[\d,]*)\s*bytes", re.IGNORECASE)
+
+
+def _jira_error_detail(response: requests.Response) -> str:
+    """Extract Jira's error wording from a failed response.
+
+    Jira reports ``{"errorMessages": [...], "errors": {...}}``; a proxy in
+    front of it may answer with plain text or HTML instead.
+
+    Args:
+        response: The failed HTTP response.
+
+    Returns:
+        The joined error messages, or a trimmed body, or an empty string.
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if isinstance(body, dict):
+        parts: list[str] = [str(m) for m in body.get("errorMessages") or [] if m]
+        errors = body.get("errors")
+        if isinstance(errors, dict):
+            parts.extend(f"{k}: {v}" for k, v in errors.items() if v)
+        message = body.get("message")
+        if not parts and message:
+            parts.append(str(message))
+        if parts:
+            return "; ".join(parts)
+    text = (getattr(response, "text", "") or "").strip()
+    if text.startswith("<"):
+        return response.reason or ""
+    return text[:500]
+
+
+def _parse_size_limit(detail: str) -> int | None:
+    """Read the byte limit out of a Jira size-rejection message.
+
+    Args:
+        detail: Jira's error text, e.g. "... maximum permitted size of
+            10485760 bytes."
+
+    Returns:
+        The limit in bytes, or None when the text does not state one.
+    """
+    match = _SIZE_LIMIT_PATTERN.search(detail)
+    if not match:
+        return None
+    return int(match.group(1).replace(",", ""))
