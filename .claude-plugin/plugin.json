@@ -2,7 +2,7 @@
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "mcp-atlassian",
   "displayName": "MCP Atlassian",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Jira and Confluence tools over MCP, with a Markdown/ADF converter that round-trips: panels, quotes, expands, tables and status lozenges survive a read, edit and write back.",
   "author": {
     "name": "Andrew Kolpakov",
