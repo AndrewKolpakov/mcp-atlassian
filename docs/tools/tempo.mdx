@@ -90,14 +90,13 @@ List the work attributes worklogs can carry, with their allowed options.
 
 ### Get Tempo Timesheet Approval
 
-Get the approval status of a timesheet for a period (read only).
+Get the approval status of the timesheet period containing a day (read only).
 
 **Parameters:**
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `date_from` | `string` | Yes | First day of the period, YYYY-MM-DD |
-| `date_to` | `string` | Yes | Last day of the period, YYYY-MM-DD |
+| `date` | `string` | No | (Optional) Any day in the period, YYYY-MM-DD; default: today. The period itself (a month, a week, ...) is Tempo's own. |
 | `account_id` | `string` | No | (Optional) Atlassian account id; default: the current user |
 
 ---

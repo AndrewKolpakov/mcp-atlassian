@@ -78,8 +78,27 @@ class TestTempoClient:
 
     def test_401_names_token_and_region(self, tempo: TempoFetcher) -> None:
         tempo.session.request.return_value = _response(401, {"errors": []})
-        with pytest.raises(MCPAtlassianAuthenticationError, match="region"):
+        with pytest.raises(MCPAtlassianAuthenticationError, match="region") as exc:
             tempo.get_worklog(1)
+        assert "GET /worklogs/1." in str(exc.value)
+
+    def test_401_keeps_tempo_text_and_names_the_jira_link(
+        self, tempo: TempoFetcher
+    ) -> None:
+        """A 401 Tempo raises while calling Jira is not a bad token or region."""
+        text = (
+            "We had a problem trying to communicate with Atlassian. Please "
+            "try again later."
+        )
+        tempo.session.request.return_value = _response(
+            401, {"errors": [{"message": text}]}
+        )
+        with pytest.raises(MCPAtlassianAuthenticationError) as exc:
+            tempo.search_worklogs()
+        message = str(exc.value)
+        assert text in message
+        assert "token is valid" in message
+        assert "TEMPO_URL" not in message
 
     def test_429_reports_retry_after(self, tempo: TempoFetcher) -> None:
         tempo.session.request.return_value = _response(
@@ -164,6 +183,24 @@ class TestTempoClient:
         assert tempo.session.request.call_count == 1
         tempo.get_work_attributes(refresh=True)
         assert tempo.session.request.call_count == 2
+
+    def test_get_period_returns_the_period_containing_the_day(
+        self, tempo: TempoFetcher
+    ) -> None:
+        tempo.session.request.return_value = _response(
+            200, {"periods": [{"from": "2026-11-01", "to": "2026-11-30"}]}
+        )
+        assert tempo.get_period("2026-11-17") == {
+            "from": "2026-11-01",
+            "to": "2026-11-30",
+        }
+        kwargs = tempo.session.request.call_args.kwargs
+        assert kwargs["params"] == {"from": "2026-11-17", "to": "2026-11-17"}
+
+    def test_get_period_refuses_when_tempo_has_none(self, tempo: TempoFetcher) -> None:
+        tempo.session.request.return_value = _response(200, {"periods": []})
+        with pytest.raises(ValueError, match="no timesheet period"):
+            tempo.get_period("2026-11-17")
 
     def test_approval_account_id_is_path_escaped(self, tempo: TempoFetcher) -> None:
         tempo.session.request.return_value = _response(200, {})

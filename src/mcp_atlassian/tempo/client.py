@@ -15,6 +15,10 @@ API_PREFIX = "/4"
 # Tempo accepts up to 5000 records per call; smaller pages keep a single
 # response, and the memory it costs, bounded.
 PAGE_SIZE = 1000
+# Tempo's 401 text when the token is accepted but its own call to Jira, made
+# as the token's owner, fails ("We had a problem trying to communicate with
+# Atlassian ..."). Endpoints that need no Jira permission check still work.
+_ATLASSIAN_LINK_FAILURE = "communicate with atlassian"
 
 
 class TempoApiError(ValueError):
@@ -44,8 +48,7 @@ def _error_messages(response: requests.Response) -> str:
                 else str(error)
                 for error in errors
             ]
-            if messages:
-                return "; ".join(messages)
+            return "; ".join(messages)
         if "message" in body:
             return str(body["message"])
     return str(body)[:500]
@@ -107,11 +110,24 @@ class TempoClient:
             timeout=self.config.timeout,
         )
         if response.status_code == 401:
-            msg = (
-                "Tempo rejected the API token (401). Check TEMPO_API_TOKEN, "
-                "that it has not expired, and that TEMPO_URL points at the "
-                f"region your Tempo data lives in (currently {self.config.url})."
-            )
+            detail = _error_messages(response)
+            msg = f"Tempo answered 401 on {method} {path}"
+            msg += f": {detail}" if detail else "."
+            if _ATLASSIAN_LINK_FAILURE in detail.lower():
+                # The token was accepted: Tempo failed calling Jira as its
+                # owner, which no token or region change fixes.
+                msg += (
+                    " The token is valid, but Tempo could not reach Jira on "
+                    "its owner's behalf. Open Tempo in Jira as that user and "
+                    "grant any access it asks for, or create a new token; if "
+                    "that does not help, it is for Tempo support."
+                )
+            else:
+                msg += (
+                    " Check TEMPO_API_TOKEN, that it has not expired, and that "
+                    "TEMPO_URL points at the region your Tempo data lives in "
+                    f"(currently {self.config.url})."
+                )
             raise MCPAtlassianAuthenticationError(msg)
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After")
@@ -120,7 +136,10 @@ class TempoClient:
             raise TempoApiError(429, msg)
         if not response.ok:
             detail = _error_messages(response)
-            msg = f"Tempo API error {response.status_code} on {method} {path}: {detail}"
+            msg = (
+                f"Tempo API error {response.status_code} on {method} {path}: "
+                f"{detail or '(no details)'}"
+            )
             if response.status_code == 403:
                 msg += (
                     " (The token may lack the scope or permission for this, or "

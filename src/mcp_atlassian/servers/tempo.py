@@ -10,7 +10,9 @@ import asyncio
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Annotated, Any
+from urllib.parse import urlencode
 
 from fastmcp import Context
 from pydantic import Field
@@ -170,10 +172,13 @@ def _display_names(jira: JiraFetcher, account_ids: set[str]) -> dict[str, str]:
     try:
         for start in range(0, len(ordered), _USER_BATCH):
             batch = ordered[start : start + _USER_BATCH]
-            response = jira.jira.get(
-                "rest/api/3/user/bulk",
-                params={"accountId": batch, "maxResults": _USER_BATCH},
+            # The query goes into the path: atlassian-python-api urlencodes
+            # params without doseq, which sends a list as the literal text
+            # "['id']" instead of one accountId parameter per id.
+            query = urlencode(
+                [("accountId", a) for a in batch] + [("maxResults", _USER_BATCH)]
             )
+            response = jira.jira.get(f"rest/api/3/user/bulk?{query}")
             for user in (response or {}).get("values") or []:
                 if user.get("accountId"):
                     names[user["accountId"]] = user.get("displayName", "")
@@ -639,40 +644,51 @@ async def get_team_members(
 )
 async def get_timesheet_approval(
     ctx: Context,
-    date_from: Annotated[str, Field(description="First day of the period, YYYY-MM-DD")],
-    date_to: Annotated[str, Field(description="Last day of the period, YYYY-MM-DD")],
+    date: Annotated[
+        str | None,
+        Field(
+            description=(
+                "(Optional) Any day in the period, YYYY-MM-DD; default: today. "
+                "The period itself (a month, a week, ...) is Tempo's own."
+            )
+        ),
+    ] = None,
     account_id: Annotated[
         str | None,
         Field(description="(Optional) Atlassian account id; default: the current user"),
     ] = None,
 ) -> str:
-    """Get the approval status of a timesheet for a period (read only).
+    """Get the approval status of the timesheet period containing a day (read only).
+
+    Tempo approves timesheets per period, with boundaries the site sets, so
+    the period is looked up from the day rather than given.
 
     Args:
         ctx: The FastMCP context.
-        date_from: First day of the period.
-        date_to: Last day of the period.
+        date: Any day in the period; defaults to today.
         account_id: Whose timesheet; defaults to the current user.
 
     Returns:
-        JSON with status (OPEN, IN_REVIEW, APPROVED), required and logged
-        time, and the reviewer.
+        JSON with the period, status (OPEN, IN_REVIEW, APPROVED), required
+        and logged time, and the reviewer.
     """
-    start = parse_date(date_from, "date_from")
-    end = parse_date(date_to, "date_to")
+    # Today in the server's local time zone: the user's day, not UTC's.
+    today = datetime.now(timezone.utc).astimezone().date()
+    day = parse_date(date, "date") if date else today.isoformat()
     jira = await get_jira_fetcher(ctx)
     tempo = await get_tempo_fetcher(ctx)
 
     def run() -> dict[str, Any]:
         owner = account_id or jira.get_current_user_account_id()
-        raw = tempo.get_timesheet_approval(owner, start, end)
+        period = tempo.get_period(day)
+        raw = tempo.get_timesheet_approval(owner, period["from"], period["to"])
         status = raw.get("status") or {}
         reviewer = (raw.get("reviewer") or {}).get("accountId")
         names = _display_names(jira, {a for a in (owner, reviewer) if a})
         result = {
             "account_id": owner,
             "name": names.get(owner),
-            "period": raw.get("period"),
+            "period": raw.get("period") or period,
             "status": status.get("key"),
             "status_updated": status.get("updatedAt"),
             "status_comment": status.get("comment") or None,

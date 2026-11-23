@@ -2,9 +2,11 @@
 
 import importlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from fastmcp import Client
@@ -109,9 +111,18 @@ def jira() -> MagicMock:
         ]
         return {"issues": issues}
 
-    def get(path: str, params: dict[str, Any]) -> dict[str, Any] | None:
-        if path == "rest/api/3/user/bulk":
-            return {"values": [{"accountId": "me-id", "displayName": "Me Myself"}]}
+    def get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        if path.startswith("rest/api/3/user/bulk?"):
+            # One accountId parameter per id, never a stringified list.
+            requested = parse_qs(urlsplit(path).query)["accountId"]
+            assert params is None
+            return {
+                "values": [
+                    {"accountId": a, "displayName": "Me Myself"}
+                    for a in requested
+                    if a == "me-id"
+                ]
+            }
         if path == "rest/api/3/issue/OLD-7":  # moved issue: old key redirects
             return {"id": "10002", "key": "PROJ-2"}
         raise RuntimeError(f"404 {path}")
@@ -547,6 +558,52 @@ async def test_get_work_attributes_lists_static_list_options(
             ],
         }
     ]
+
+
+@pytest.mark.anyio
+async def test_get_timesheet_approval_looks_up_the_period_of_a_day(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    jira: MagicMock,
+    tempo: MagicMock,
+) -> None:
+    """Tempo answers only for its own period, so a mid-period day must work."""
+    _configure(monkeypatch, tmp_path)
+    tempo.get_period.return_value = {"from": "2026-11-01", "to": "2026-11-30"}
+    tempo.get_timesheet_approval.return_value = {
+        "period": {"from": "2026-11-01", "to": "2026-11-30"},
+        "status": {"key": "OPEN"},
+        "requiredSeconds": 604800,
+        "timeSpentSeconds": 315000,
+    }
+    body = _payload(
+        await _call("tempo_get_timesheet_approval", {"date": "2026-11-17"}, jira, tempo)
+    )
+    tempo.get_period.assert_called_once_with("2026-11-17")
+    tempo.get_timesheet_approval.assert_called_once_with(
+        "me-id", "2026-11-01", "2026-11-30"
+    )
+    assert body["status"] == "OPEN"
+    assert body["name"] == "Me Myself"
+    assert body["period"] == {"from": "2026-11-01", "to": "2026-11-30"}
+    assert body["required"] == "168h"
+    assert body["time_spent"] == "87h 30m"
+
+
+@pytest.mark.anyio
+async def test_get_timesheet_approval_defaults_to_today(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    jira: MagicMock,
+    tempo: MagicMock,
+) -> None:
+    _configure(monkeypatch, tmp_path)
+    tempo.get_period.return_value = {"from": "2026-11-01", "to": "2026-11-30"}
+    tempo.get_timesheet_approval.return_value = {"status": {"key": "OPEN"}}
+    _payload(await _call("tempo_get_timesheet_approval", {}, jira, tempo))
+    tempo.get_period.assert_called_once_with(
+        datetime.now(timezone.utc).astimezone().date().isoformat()
+    )
 
 
 # ---------------------------------------------------------------------------
