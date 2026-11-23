@@ -1,0 +1,142 @@
+---
+title: "Tempo"
+description: "Tempo Cloud worklogs with work attributes, accounts, teams, and timesheet approval status"
+---
+
+### Search Tempo Worklogs
+
+Search Tempo worklogs for a period, by issue, project and author.
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `date_from` | `string` | Yes | First day to include, YYYY-MM-DD (inclusive) |
+| `date_to` | `string` | Yes | Last day to include, YYYY-MM-DD (inclusive) |
+| `issue_keys` | `string` | No | (Optional) Comma-separated issue keys, e.g. 'PROJ-1,PROJ-2' |
+| `project_keys` | `string` | No | (Optional) Comma-separated project keys, e.g. 'PROJ,OPS' |
+| `authors` | `string` | No | (Optional) Whose worklogs: 'me', 'all', or comma-separated Atlassian account ids. Default: 'me' when no issue or project filter is given, otherwise 'all'. |
+| `limit` | `integer` | No | Maximum number of worklogs to return |
+
+---
+
+### Get Tempo Worklog
+
+Get one Tempo worklog by its id.
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `worklog_id` | `integer` | Yes | Tempo worklog id |
+
+---
+
+### Create Tempo Worklog
+
+Log time to a Jira issue in Tempo, as the current user.
+
+<Note>This is a **write** tool. Disabled when `READ_ONLY_MODE=true`.</Note>
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `issue_key` | `string` | Yes | Jira issue key, e.g. 'PROJ-123' |
+| `time_spent` | `string` | Yes | Time spent, e.g. '1h 30m', '45m', '1.5h' (no days) |
+| `date` | `string` | Yes | Day the work was done, YYYY-MM-DD |
+| `start_time` | `string` | No | (Optional) Local start time, HH:MM or HH:MM:SS |
+| `description` | `string` | No | (Optional) Worklog description (plain text) |
+| `billable_time` | `string` | No | (Optional) Billable time, e.g. '1h'. Omit to let Tempo apply its default for the account. |
+| `account_key` | `string` | No | (Optional) Tempo account key to log against |
+| `attributes` | `string` | No | (Optional) Work attribute values as a JSON object, keyed by attribute key or name, e.g. '`{"_Role_": "Developer"}`'. See tempo_get_work_attributes. |
+| `remaining_estimate` | `string` | No | (Optional) New remaining estimate for the issue, e.g. '2h'. Omit to leave the estimate to Tempo/Jira. |
+
+---
+
+### Update Tempo Worklog
+
+Change an existing Tempo worklog; fields not given are kept.
+
+<Note>This is a **write** tool. Disabled when `READ_ONLY_MODE=true`.</Note>
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `worklog_id` | `integer` | Yes | Tempo worklog id |
+| `time_spent` | `string` | No | (Optional) New time spent, e.g. '2h' |
+| `date` | `string` | No | (Optional) New day, YYYY-MM-DD |
+| `start_time` | `string` | No | (Optional) New local start time, HH:MM |
+| `description` | `string` | No | (Optional) New description (plain text) |
+| `billable_time` | `string` | No | (Optional) New billable time, e.g. '1h' |
+| `account_key` | `string` | No | (Optional) New Tempo account key |
+| `attributes` | `string` | No | (Optional) Work attribute values to change, as a JSON object; a null value removes that attribute. Others are kept. |
+| `remaining_estimate` | `string` | No | (Optional) New remaining estimate for the issue, e.g. '2h' |
+
+---
+
+### Get Tempo Work Attributes
+
+List the work attributes worklogs can carry, with their allowed options.
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `search` | `string` | No | (Optional) Only attributes whose key or name contains this |
+
+---
+
+### Get Tempo Timesheet Approval
+
+Get the approval status of a timesheet for a period (read only).
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `date_from` | `string` | Yes | First day of the period, YYYY-MM-DD |
+| `date_to` | `string` | Yes | Last day of the period, YYYY-MM-DD |
+| `account_id` | `string` | No | (Optional) Atlassian account id; default: the current user |
+
+---
+
+### Search Tempo Accounts
+
+Search Tempo accounts (the billing accounts worklogs are logged against).
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `keys` | `string` | No | (Optional) Comma-separated account keys |
+| `statuses` | `string` | No | Comma-separated statuses: OPEN, CLOSED, ARCHIVED. Default OPEN; pass 'all' for every status. |
+| `limit` | `integer` | No | Maximum number of accounts |
+
+---
+
+### Get Tempo Teams
+
+List Tempo teams.
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | `string` | No | (Optional) Team name filter |
+| `limit` | `integer` | No | Maximum number of teams |
+
+---
+
+### Get Tempo Team Members
+
+List the members of a Tempo team with their names and active role.
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `team_id` | `integer` | Yes | Tempo team id (from tempo_get_teams) |
+
+---

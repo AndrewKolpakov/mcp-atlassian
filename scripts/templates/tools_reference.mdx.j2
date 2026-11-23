@@ -1,9 +1,9 @@
 ---
 title: "Tools Reference"
-description: "Overview of all {{ counts.total_tools }} MCP tools for Jira and Confluence — organized by category with quick links"
+description: "Overview of all {{ counts.total_tools }} MCP tools for Jira, Confluence and Tempo — organized by category with quick links"
 ---
 
-MCP Atlassian provides **{{ counts.total_tools }} tools** for interacting with Jira and Confluence. Tools are organized by category below.
+MCP Atlassian provides **{{ counts.total_tools }} tools** for interacting with Jira, Confluence and Tempo. Tools are organized by category below.
 
 ## Jira Tools
 
@@ -57,6 +57,14 @@ MCP Atlassian provides **{{ counts.total_tools }} tools** for interacting with J
   </Card>
 </CardGroup>
 
+## Tempo Tools
+
+<CardGroup cols={2}>
+  <Card title="Tempo" icon="clock" href="/docs/tools/tempo">
+    Worklogs with work attributes, accounts, teams, timesheet approvals
+  </Card>
+</CardGroup>
+
 ## Tool Access Control
 
 ### Toolset Groups
@@ -76,6 +84,14 @@ Toolsets group related tools for easier management via `TOOLSETS` env var or `--
 | Toolset | Core | Tools |
 |---------|:----:|-------|
 {% for toolset in toolsets.confluence -%}
+| `{{ toolset.name }}` | {{ "Yes" if toolset.core else "No" }} | {% for tool_name in toolset.tools %}`{{ tool_name }}`{% if not loop.last %}, {% endif %}{% endfor %} |
+{% endfor %}
+
+**Tempo Toolsets ({{ counts.tempo_toolsets }}):**
+
+| Toolset | Core | Tools |
+|---------|:----:|-------|
+{% for toolset in toolsets.tempo -%}
 | `{{ toolset.name }}` | {{ "Yes" if toolset.core else "No" }} | {% for tool_name in toolset.tools %}`{{ tool_name }}`{% if not loop.last %}, {% endif %}{% endfor %} |
 {% endfor %}
 

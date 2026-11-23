@@ -1,9 +1,9 @@
 ---
 title: "Tools Reference"
-description: "Overview of all 100 MCP tools for Jira and Confluence — organized by category with quick links"
+description: "Overview of all 109 MCP tools for Jira, Confluence and Tempo — organized by category with quick links"
 ---
 
-MCP Atlassian provides **100 tools** for interacting with Jira and Confluence. Tools are organized by category below.
+MCP Atlassian provides **109 tools** for interacting with Jira, Confluence and Tempo. Tools are organized by category below.
 
 ## Jira Tools
 
@@ -57,6 +57,14 @@ MCP Atlassian provides **100 tools** for interacting with Jira and Confluence. T
   </Card>
 </CardGroup>
 
+## Tempo Tools
+
+<CardGroup cols={2}>
+  <Card title="Tempo" icon="clock" href="/docs/tools/tempo">
+    Worklogs with work attributes, accounts, teams, timesheet approvals
+  </Card>
+</CardGroup>
+
 ## Tool Access Control
 
 ### Toolset Groups
@@ -97,6 +105,14 @@ Toolsets group related tools for easier management via `TOOLSETS` env var or `--
 | `confluence_templates` | No | `confluence_list_page_templates`, `confluence_get_page_template`, `confluence_create_page_from_template` |
 | `confluence_permissions` | No | `confluence_check_content_permissions`, `confluence_get_space_permissions` |
 
+**Tempo Toolsets (3):**
+
+| Toolset | Core | Tools |
+|---------|:----:|-------|
+| `tempo_worklogs` | No | `tempo_search_worklogs`, `tempo_get_worklog`, `tempo_get_work_attributes`, `tempo_get_timesheet_approval`, `tempo_create_worklog`, `tempo_update_worklog` |
+| `tempo_accounts` | No | `tempo_search_accounts` |
+| `tempo_teams` | No | `tempo_get_teams`, `tempo_get_team_members` |
+
 **Migration Toolsets (1):**
 
 | Toolset | Core | Purpose | Tools |
@@ -111,7 +127,7 @@ TOOLSETS=default,jira_agile,jira_attachments
 # Enable deprecated tools only while migrating to their replacements:
 TOOLSETS=legacy
 
-# Enable all toolsets (100 tools)
+# Enable all toolsets (109 tools)
 TOOLSETS=all
 
 # Command line
