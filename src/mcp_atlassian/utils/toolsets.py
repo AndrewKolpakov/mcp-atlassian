@@ -1,6 +1,6 @@
 """Toolset definitions and filtering utilities for MCP Atlassian.
 
-Groups 98 tools into 25 named toolsets controlled via the TOOLSETS env var.
+Groups 109 tools into 28 named toolsets controlled via the TOOLSETS env var.
 Supports 'all', 'default', and comma-separated toolset names.
 """
 
@@ -152,11 +152,32 @@ CONFLUENCE_TOOLSETS: dict[str, ToolsetDefinition] = {
     ),
 }
 
+# --- Tempo toolsets (3) ---
+
+TEMPO_TOOLSETS: dict[str, ToolsetDefinition] = {
+    "tempo_worklogs": ToolsetDefinition(
+        name="tempo_worklogs",
+        description="Tempo worklogs, work attributes, and timesheet approval status",
+        default=False,
+    ),
+    "tempo_accounts": ToolsetDefinition(
+        name="tempo_accounts",
+        description="Tempo account lookup",
+        default=False,
+    ),
+    "tempo_teams": ToolsetDefinition(
+        name="tempo_teams",
+        description="Tempo teams and their members",
+        default=False,
+    ),
+}
+
 # --- Combined registry ---
 
 ALL_TOOLSETS: dict[str, ToolsetDefinition] = {
     **JIRA_TOOLSETS,
     **CONFLUENCE_TOOLSETS,
+    **TEMPO_TOOLSETS,
     "legacy": ToolsetDefinition(
         name="legacy",
         description="Deprecated tools retained for migration compatibility",
@@ -172,7 +193,7 @@ DEFAULT_TOOLSETS: set[str] = {
 def get_enabled_toolsets() -> set[str]:
     """Parse the TOOLSETS env var into a set of enabled toolset names.
 
-    Supports keywords 'all' (all 25 toolsets) and 'default' (6 defaults),
+    Supports keywords 'all' (all 28 toolsets) and 'default' (6 defaults),
     plus comma-separated specific toolset names. Case-insensitive for keywords.
 
     When TOOLSETS is unset or empty, returns all toolsets with a deprecation
@@ -185,9 +206,9 @@ def get_enabled_toolsets() -> set[str]:
         names are given, returns an empty set (fail-closed).
 
     Examples:
-        TOOLSETS unset -> all 25 toolsets (with deprecation warning)
-        TOOLSETS="" -> all 25 toolsets (with deprecation warning)
-        TOOLSETS="all" -> all 25 names
+        TOOLSETS unset -> all 28 toolsets (with deprecation warning)
+        TOOLSETS="" -> all 28 toolsets (with deprecation warning)
+        TOOLSETS="all" -> all 28 names
         TOOLSETS="default" -> 6 default names
         TOOLSETS="default,jira_agile" -> defaults + jira_agile
         TOOLSETS="typo_name" -> set() (fail-closed)

@@ -1,6 +1,7 @@
-"""Dependency providers for JiraFetcher and ConfluenceFetcher with context awareness.
+"""Dependency providers for JiraFetcher, ConfluenceFetcher and TempoFetcher.
 
-Provides get_jira_fetcher and get_confluence_fetcher for use in tool functions.
+Provides get_jira_fetcher, get_confluence_fetcher and get_tempo_fetcher for use
+in tool functions.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from starlette.requests import Request
 from mcp_atlassian.confluence import ConfluenceConfig, ConfluenceFetcher
 from mcp_atlassian.jira import JiraConfig, JiraFetcher
 from mcp_atlassian.servers.context import MainAppContext
+from mcp_atlassian.tempo import TempoConfig, TempoFetcher
 from mcp_atlassian.utils.env import (
     get_header_names,
     is_env_ssl_verify,
@@ -1078,3 +1080,63 @@ async def get_confluence_fetcher(ctx: Context) -> ConfluenceFetcher:
         ValueError: If configuration or credentials are invalid.
     """
     return await _get_fetcher(ctx, _confluence_spec())
+
+
+_tempo_fetchers: dict[TempoConfig, TempoFetcher] = {}
+_tempo_fetchers_lock = threading.Lock()
+
+
+async def get_tempo_fetcher(ctx: Context) -> TempoFetcher:
+    """Returns the TempoFetcher for the server-wide Tempo configuration.
+
+    The Tempo token is one person's: Tempo has no per-request identity here,
+    so every call acts as the token's owner. Over HTTP that is only sound
+    when the deployment is single-user, so an HTTP request is refused when it
+    carries its own Atlassian identity (it would read and write as someone
+    else in Tempo) or when the operator has not opted into global credentials
+    with ALLOW_GLOBAL_CRED_FALLBACK. Stdio is unaffected.
+
+    The fetcher is reused across calls so its work attribute catalog stays
+    cached.
+
+    Args:
+        ctx: The FastMCP context.
+
+    Returns:
+        The TempoFetcher for the configured token.
+
+    Raises:
+        ValueError: If Tempo is not configured or the request may not use it.
+    """
+    app_ctx = _get_app_lifespan_ctx(ctx)
+    config = getattr(app_ctx, "full_tempo_config", None) if app_ctx else None
+    if config is None:
+        raise ValueError(
+            "Tempo is not configured. Set TEMPO_API_TOKEN (and JIRA_URL for a "
+            "Jira Cloud site)."
+        )
+
+    try:
+        request = get_http_request()
+    except RuntimeError:
+        request = None
+    if request is not None:
+        if getattr(request.state, "user_atlassian_auth_type", None):
+            raise ValueError(
+                "Tempo tools are not available to requests with per-user "
+                "Atlassian credentials: the server's Tempo token belongs to one "
+                "person and would act as them."
+            )
+        if not is_env_truthy("ALLOW_GLOBAL_CRED_FALLBACK"):
+            raise ValueError(
+                "Tempo tools over HTTP use the operator's Tempo token; set "
+                "ALLOW_GLOBAL_CRED_FALLBACK=true to allow that (single-user "
+                "deployments only)."
+            )
+
+    with _tempo_fetchers_lock:
+        fetcher = _tempo_fetchers.get(config)
+        if fetcher is None:
+            fetcher = TempoFetcher(config=config)
+            _tempo_fetchers[config] = fetcher
+    return fetcher

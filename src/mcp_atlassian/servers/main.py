@@ -23,6 +23,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from mcp_atlassian.confluence.config import ConfluenceConfig
 from mcp_atlassian.jira.config import JiraConfig
+from mcp_atlassian.tempo.config import TempoConfig
 from mcp_atlassian.utils.env import is_env_truthy
 from mcp_atlassian.utils.environment import get_available_services
 from mcp_atlassian.utils.io import is_read_only_mode
@@ -47,6 +48,7 @@ from .context import MainAppContext
 from .error_handling import ErrorPreservingFastMCP
 from .jira import jira_mcp
 from .oauth_proxy import HardenedOAuthProxy, parse_env_list
+from .tempo import tempo_mcp
 
 logger = logging.getLogger("mcp-atlassian.server.main")
 
@@ -135,6 +137,36 @@ async def health_check(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
+def _load_tempo_config(jira_config: JiraConfig | None) -> TempoConfig | None:
+    """Load the Tempo Cloud configuration when TEMPO_API_TOKEN is set.
+
+    Tempo Cloud references issues by numeric Jira id and authors by Atlassian
+    account id, so its tools resolve both through Jira: without a configured
+    Jira Cloud site they cannot work, and the configuration is not loaded.
+    """
+    if not os.getenv("TEMPO_API_TOKEN", "").strip():
+        return None
+    if jira_config is None:
+        logger.warning(
+            "TEMPO_API_TOKEN is set but Jira is not configured; Tempo tools "
+            "need Jira and will be unavailable."
+        )
+        return None
+    if not jira_config.is_cloud:
+        logger.warning(
+            "TEMPO_API_TOKEN is set but JIRA_URL is not a Jira Cloud site; the "
+            "Tempo tools target Tempo Cloud and will be unavailable."
+        )
+        return None
+    try:
+        tempo_config = TempoConfig.from_env()
+    except ValueError as e:
+        logger.error(f"Failed to load Tempo configuration: {e}")
+        return None
+    logger.info(f"Tempo configuration loaded ({tempo_config.url}).")
+    return tempo_config
+
+
 @asynccontextmanager
 async def main_lifespan(app: FastMCP[MainAppContext]) -> AsyncIterator[dict[str, Any]]:
     logger.info("Main Atlassian MCP server lifespan starting...")
@@ -176,9 +208,12 @@ async def main_lifespan(app: FastMCP[MainAppContext]) -> AsyncIterator[dict[str,
         except Exception as e:
             logger.error(f"Failed to load Confluence configuration: {e}", exc_info=True)
 
+    loaded_tempo_config = _load_tempo_config(loaded_jira_config)
+
     app_context = MainAppContext(
         full_jira_config=loaded_jira_config,
         full_confluence_config=loaded_confluence_config,
+        full_tempo_config=loaded_tempo_config,
         read_only=read_only,
         enabled_tools=enabled_tools,
         enabled_toolsets=enabled_toolsets,
@@ -335,6 +370,12 @@ class AtlassianMCP(ErrorPreservingFastMCP[MainAppContext]):
 
         is_jira_tool = "jira" in tool_tags
         is_confluence_tool = "confluence" in tool_tags
+        if "tempo" in tool_tags:
+            # Tempo has no header-based configuration: it is available only
+            # when the server loaded a Tempo config at startup.
+            return bool(
+                app_lifespan_state and app_lifespan_state.full_tempo_config is not None
+            )
         if app_lifespan_state:
             jira_available = (
                 app_lifespan_state.full_jira_config is not None
@@ -921,6 +962,7 @@ main_mcp = AtlassianMCP(
 )
 main_mcp.mount(jira_mcp, namespace="jira")
 main_mcp.mount(confluence_mcp, namespace="confluence")
+main_mcp.mount(tempo_mcp, namespace="tempo")
 
 
 @main_mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
