@@ -16,6 +16,8 @@
         "CONFLUENCE_URL": "${user_config.confluence_url}",
         "CONFLUENCE_USERNAME": "${user_config.confluence_username}",
         "CONFLUENCE_API_TOKEN": "${user_config.confluence_api_token}",
+        "TEMPO_API_TOKEN": "${user_config.tempo_api_token}",
+        "TEMPO_URL": "${user_config.tempo_url}",
         "MCP_ATLASSIAN_SRC": "${user_config.server_source}"
       }
     }

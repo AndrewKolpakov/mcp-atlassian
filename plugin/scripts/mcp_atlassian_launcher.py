@@ -37,6 +37,8 @@ CREDENTIAL_VARS = (
     "CONFLUENCE_USERNAME",
     "CONFLUENCE_API_TOKEN",
     "CONFLUENCE_PERSONAL_TOKEN",
+    "TEMPO_API_TOKEN",
+    "TEMPO_URL",
 )
 # One of these has to be set, or the server has no site to talk to.
 SITE_VARS = ("JIRA_URL", "CONFLUENCE_URL")

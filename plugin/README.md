@@ -5,7 +5,7 @@ marketplace. It is a fork of [sooperset/mcp-atlassian](https://github.com/sooper
 the converter work that makes formatted content survive a read/edit/write cycle
 is what the fork adds. Installing the plugin gives you three things:
 
-- **the MCP server** — 98 Jira and Confluence tools;
+- **the MCP server** — 109 Jira, Confluence and Tempo tools;
 - **the `jira-content` skill** — the rules for moving formatted content through
   it, and the measured ADF↔wiki behaviour behind them;
 - **an ADF write guard** — a `PreToolUse` hook that refuses a body Jira would
@@ -109,6 +109,24 @@ reads `BITBUCKET_WORKSPACE`, `BITBUCKET_USERNAME`, `BITBUCKET_PASSWORD`,
 `BITBUCKET_TOKEN` and `BITBUCKET_URL` from the same sections, layered by the same
 rules. This launcher ignores those keys, and that one ignores the Jira and
 Confluence ones.
+
+### Tempo (optional)
+
+The `tempo_*` tools read and write Tempo Cloud worklogs (with work attributes
+and accounts), and read accounts, teams and timesheet approval status. They
+appear only when a Tempo token is set **and** `JIRA_URL` is a Jira Cloud site:
+Tempo names issues by numeric Jira id, which the tools translate through Jira.
+
+```ini
+[default]
+TEMPO_API_TOKEN = ...
+# TEMPO_URL = https://api.eu.tempo.io   # only if your Tempo data lives there
+```
+
+Create the token in Tempo → Settings → Data Access → API integration, **as the
+same person as the Jira account**: worklogs are authored as the Jira user, and
+the token acts with its creator's Tempo permissions. A host for the wrong region
+answers 401. There is deliberately no delete tool.
 
 Every variable the server understands — proxies, SSL, toolset filtering,
 read-only mode — is listed in [`.env.example`](../.env.example). Set those in the

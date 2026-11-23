@@ -3,7 +3,7 @@
   "name": "mcp-atlassian",
   "displayName": "MCP Atlassian",
   "version": "0.2.0",
-  "description": "Jira and Confluence tools over MCP, with a Markdown/ADF converter that round-trips: panels, quotes, expands, tables and status lozenges survive a read, edit and write back.",
+  "description": "Jira, Confluence and Tempo tools over MCP, with a Markdown/ADF converter that round-trips: panels, quotes, expands, tables and status lozenges survive a read, edit and write back.",
   "author": {
     "name": "Andrew Kolpakov",
     "email": "andrew.kolpakov@gmail.com"
@@ -49,6 +49,17 @@
       "title": "Confluence API token",
       "description": "The same token as Jira works on Atlassian Cloud.",
       "sensitive": true
+    },
+    "tempo_api_token": {
+      "type": "string",
+      "title": "Tempo API token",
+      "description": "Optional; enables the tempo_* tools on a Jira Cloud site. Create it in Tempo \u2192 Settings \u2192 Data Access \u2192 API integration, as the same person as the Jira account.",
+      "sensitive": true
+    },
+    "tempo_url": {
+      "type": "string",
+      "title": "Tempo API base URL",
+      "description": "Optional. Default https://api.tempo.io; use https://api.eu.tempo.io or https://api.us.tempo.io for your data's region."
     },
     "server_source": {
       "type": "directory",
