@@ -114,8 +114,9 @@ Confluence ones.
 
 The `tempo_*` tools read and write Tempo Cloud worklogs (with work attributes
 and accounts), and read accounts, teams and timesheet approval status. They
-appear only when a Tempo token is set **and** `JIRA_URL` is a Jira Cloud site:
-Tempo names issues by numeric Jira id, which the tools translate through Jira.
+appear only when a Tempo token is set **and** there is a Jira Cloud site to
+translate issue keys through: Tempo names issues by numeric Jira id. That site
+is `JIRA_URL`, unless `TEMPO_JIRA_*` names another one.
 
 ```ini
 [default]
@@ -127,6 +128,22 @@ Create the token in Tempo → Settings → Data Access → API integration, **as
 same person as the Jira account**: worklogs are authored as the Jira user, and
 the token acts with its creator's Tempo permissions. A host for the wrong region
 answers 401. There is deliberately no delete tool.
+
+When time is logged in another site's Tempo than the one the Jira tools work
+on, give Tempo its own site. The `jira_*` tools keep `JIRA_URL`; the `tempo_*`
+tools then take that site's issue keys, and a key from `JIRA_URL`'s site is
+refused as not found rather than logged against an unrelated issue:
+
+```ini
+[~/work/client]
+JIRA_URL = https://client.atlassian.net
+JIRA_USERNAME = you@client.com
+JIRA_API_TOKEN = ...
+TEMPO_API_TOKEN = ...
+TEMPO_JIRA_URL = https://employer.atlassian.net
+TEMPO_JIRA_USERNAME = you@employer.com
+TEMPO_JIRA_API_TOKEN = ...
+```
 
 Every variable the server understands — proxies, SSL, toolset filtering,
 read-only mode — is listed in [`.env.example`](../.env.example). Set those in the

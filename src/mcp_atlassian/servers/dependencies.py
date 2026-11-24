@@ -1083,6 +1083,7 @@ async def get_confluence_fetcher(ctx: Context) -> ConfluenceFetcher:
 
 
 _tempo_fetchers: dict[TempoConfig, TempoFetcher] = {}
+_tempo_jira_fetchers: dict[TempoConfig, JiraFetcher] = {}
 _tempo_fetchers_lock = threading.Lock()
 
 
@@ -1139,4 +1140,41 @@ async def get_tempo_fetcher(ctx: Context) -> TempoFetcher:
         if fetcher is None:
             fetcher = TempoFetcher(config=config)
             _tempo_fetchers[config] = fetcher
+    return fetcher
+
+
+async def get_tempo_jira_fetcher(ctx: Context) -> JiraFetcher:
+    """Returns the JiraFetcher the Tempo tools resolve keys and people through.
+
+    That is the Jira Cloud site Tempo belongs to: the TEMPO_JIRA_* site when
+    configured, so the Jira tools can serve another site, otherwise the
+    regular Jira fetcher. The same HTTP policy as ``get_tempo_fetcher``
+    applies, since TEMPO_JIRA_* credentials are the operator's too.
+
+    Args:
+        ctx: The FastMCP context.
+
+    Returns:
+        The JiraFetcher for Tempo's Jira site.
+
+    Raises:
+        ValueError: If Tempo is not configured or the request may not use it.
+    """
+    tempo = await get_tempo_fetcher(ctx)
+    config = tempo.config
+    if not config.has_own_jira:
+        return await get_jira_fetcher(ctx)
+    with _tempo_fetchers_lock:
+        fetcher = _tempo_jira_fetchers.get(config)
+        if fetcher is None:
+            fetcher = JiraFetcher(
+                config=JiraConfig(
+                    url=config.jira_url or "",
+                    auth_type="basic",
+                    username=config.jira_username,
+                    api_token=config.jira_api_token,
+                    timeout=config.timeout,
+                )
+            )
+            _tempo_jira_fetchers[config] = fetcher
     return fetcher

@@ -141,27 +141,35 @@ def _load_tempo_config(jira_config: JiraConfig | None) -> TempoConfig | None:
     """Load the Tempo Cloud configuration when TEMPO_API_TOKEN is set.
 
     Tempo Cloud references issues by numeric Jira id and authors by Atlassian
-    account id, so its tools resolve both through Jira: without a configured
-    Jira Cloud site they cannot work, and the configuration is not loaded.
+    account id, so its tools resolve both through a Jira Cloud site: the one
+    named by TEMPO_JIRA_URL when set, otherwise JIRA_URL. Without such a site
+    they cannot work, and the configuration is not loaded.
     """
     if not os.getenv("TEMPO_API_TOKEN", "").strip():
-        return None
-    if jira_config is None:
-        logger.warning(
-            "TEMPO_API_TOKEN is set but Jira is not configured; Tempo tools "
-            "need Jira and will be unavailable."
-        )
-        return None
-    if not jira_config.is_cloud:
-        logger.warning(
-            "TEMPO_API_TOKEN is set but JIRA_URL is not a Jira Cloud site; the "
-            "Tempo tools target Tempo Cloud and will be unavailable."
-        )
         return None
     try:
         tempo_config = TempoConfig.from_env()
     except ValueError as e:
         logger.error(f"Failed to load Tempo configuration: {e}")
+        return None
+    if tempo_config.has_own_jira:
+        logger.info(
+            f"Tempo configuration loaded ({tempo_config.url}); issue keys "
+            f"resolve through {tempo_config.jira_url}."
+        )
+        return tempo_config
+    if jira_config is None:
+        logger.warning(
+            "TEMPO_API_TOKEN is set but Jira is not configured; Tempo tools "
+            "need Jira (JIRA_URL or TEMPO_JIRA_URL) and will be unavailable."
+        )
+        return None
+    if not jira_config.is_cloud:
+        logger.warning(
+            "TEMPO_API_TOKEN is set but JIRA_URL is not a Jira Cloud site; the "
+            "Tempo tools target Tempo Cloud and will be unavailable. Set "
+            "TEMPO_JIRA_URL to the Cloud site Tempo belongs to."
+        )
         return None
     logger.info(f"Tempo configuration loaded ({tempo_config.url}).")
     return tempo_config

@@ -69,6 +69,7 @@ def _configure(
     jira_url: str = "https://example.atlassian.net",
     tempo_token: str | None = "tempo-token",
     read_only: bool = False,
+    tempo_jira: bool = False,
 ) -> None:
     monkeypatch.setenv("JIRA_URL", jira_url)
     monkeypatch.setenv("JIRA_USERNAME", "me@example.com")
@@ -85,6 +86,16 @@ def _configure(
     else:
         monkeypatch.setenv("TEMPO_API_TOKEN", tempo_token)
     monkeypatch.delenv("TEMPO_URL", raising=False)
+    tempo_jira_env = {
+        "TEMPO_JIRA_URL": "https://tempo-site.atlassian.net",
+        "TEMPO_JIRA_USERNAME": "me@example.com",
+        "TEMPO_JIRA_API_TOKEN": "tempo-jira-token",
+    }
+    for name, value in tempo_jira_env.items():
+        if tempo_jira:
+            monkeypatch.setenv(name, value)
+        else:
+            monkeypatch.delenv(name, raising=False)
 
 
 def _main_mcp() -> Any:
@@ -155,7 +166,7 @@ async def _call(
 ) -> Any:
     with (
         patch(
-            "mcp_atlassian.servers.tempo.get_jira_fetcher",
+            "mcp_atlassian.servers.tempo.get_tempo_jira_fetcher",
             new_callable=AsyncMock,
             return_value=jira,
         ),
@@ -192,6 +203,20 @@ async def test_tempo_tools_listed_with_token_and_cloud_jira(
     async with Client(_main_mcp()) as client:
         names = {tool.name for tool in await client.list_tools()}
     assert TEMPO_TOOLS <= names
+
+
+@pytest.mark.anyio
+async def test_tempo_tools_listed_with_own_jira_beside_server_dc_jira(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """TEMPO_JIRA_* makes Tempo independent of what JIRA_URL points at."""
+    _configure(
+        monkeypatch, tmp_path, jira_url="https://jira.example.test", tempo_jira=True
+    )
+    async with Client(_main_mcp()) as client:
+        names = {tool.name for tool in await client.list_tools()}
+    assert TEMPO_TOOLS <= names
+    assert "jira_get_issue" in names
 
 
 @pytest.mark.parametrize(
@@ -689,3 +714,80 @@ async def test_get_tempo_fetcher_allows_opted_in_single_user_http(
     ):
         fetcher = await get_tempo_fetcher(_ctx_with(TempoConfig(api_token="t2")))
     assert isinstance(fetcher, TempoFetcher)
+
+
+@pytest.mark.anyio
+async def test_get_tempo_jira_fetcher_uses_the_tempo_jira_site() -> None:
+    """Keys must resolve on Tempo's site, never on the Jira tools' site."""
+    from mcp_atlassian.servers.dependencies import get_tempo_jira_fetcher
+
+    config = TempoConfig(
+        api_token="own-jira-token",
+        jira_url="https://tempo-site.atlassian.net",
+        jira_username="me@example.com",
+        jira_api_token="tempo-jira-token",
+    )
+    ctx = _ctx_with(config)
+    with (
+        patch(
+            "mcp_atlassian.servers.dependencies.get_http_request",
+            side_effect=RuntimeError("no http"),
+        ),
+        patch(
+            "mcp_atlassian.servers.dependencies.get_jira_fetcher",
+            new_callable=AsyncMock,
+        ) as regular,
+    ):
+        first = await get_tempo_jira_fetcher(ctx)
+        second = await get_tempo_jira_fetcher(ctx)
+    regular.assert_not_called()
+    assert first is second
+    assert first.config.url == "https://tempo-site.atlassian.net"
+    assert first.config.username == "me@example.com"
+    assert first.config.auth_type == "basic"
+
+
+@pytest.mark.anyio
+async def test_get_tempo_jira_fetcher_falls_back_to_the_jira_tools_site() -> None:
+    from mcp_atlassian.servers.dependencies import get_tempo_jira_fetcher
+
+    regular_fetcher = MagicMock(spec=JiraFetcher)
+    with (
+        patch(
+            "mcp_atlassian.servers.dependencies.get_http_request",
+            side_effect=RuntimeError("no http"),
+        ),
+        patch(
+            "mcp_atlassian.servers.dependencies.get_jira_fetcher",
+            new_callable=AsyncMock,
+            return_value=regular_fetcher,
+        ),
+    ):
+        fetcher = await get_tempo_jira_fetcher(
+            _ctx_with(TempoConfig(api_token="fallback-token"))
+        )
+    assert fetcher is regular_fetcher
+
+
+@pytest.mark.anyio
+@pytest.mark.security_regression
+async def test_get_tempo_jira_fetcher_applies_the_http_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TEMPO_JIRA_* credentials are the operator's, like the Tempo token."""
+    from mcp_atlassian.servers.dependencies import get_tempo_jira_fetcher
+
+    monkeypatch.delenv("ALLOW_GLOBAL_CRED_FALLBACK", raising=False)
+    request = MagicMock()
+    request.state.user_atlassian_auth_type = None
+    config = TempoConfig(
+        api_token="policy-token",
+        jira_url="https://tempo-site.atlassian.net",
+        jira_username="me@example.com",
+        jira_api_token="tempo-jira-token",
+    )
+    with patch(
+        "mcp_atlassian.servers.dependencies.get_http_request", return_value=request
+    ):
+        with pytest.raises(ValueError, match="ALLOW_GLOBAL_CRED_FALLBACK"):
+            await get_tempo_jira_fetcher(_ctx_with(config))

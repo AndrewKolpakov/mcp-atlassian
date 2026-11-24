@@ -19,7 +19,10 @@ from pydantic import Field
 
 from mcp_atlassian.jira import JiraFetcher
 from mcp_atlassian.models.tempo import TempoWorklog, simplify_work_attribute
-from mcp_atlassian.servers.dependencies import get_jira_fetcher, get_tempo_fetcher
+from mcp_atlassian.servers.dependencies import (
+    get_tempo_fetcher,
+    get_tempo_jira_fetcher,
+)
 from mcp_atlassian.servers.error_handling import ErrorPreservingFastMCP
 from mcp_atlassian.servers.jira import ISSUE_KEY_PATTERN, PROJECT_KEY_PATTERN
 from mcp_atlassian.tempo import TempoFetcher
@@ -392,7 +395,7 @@ async def search_worklogs(
     if not author_mode:
         author_mode = "all" if (issue_key_list or project_key_list) else "me"
 
-    jira = await get_jira_fetcher(ctx)
+    jira = await get_tempo_jira_fetcher(ctx)
     tempo = await get_tempo_fetcher(ctx)
 
     def run() -> dict[str, Any]:
@@ -442,7 +445,7 @@ async def get_worklog(
     Returns:
         JSON with the worklog.
     """
-    jira = await get_jira_fetcher(ctx)
+    jira = await get_tempo_jira_fetcher(ctx)
     tempo = await get_tempo_fetcher(ctx)
 
     def run() -> dict[str, Any]:
@@ -609,7 +612,7 @@ async def get_team_members(
     Returns:
         JSON with the members: account id, display name, role, commitment.
     """
-    jira = await get_jira_fetcher(ctx)
+    jira = await get_tempo_jira_fetcher(ctx)
     tempo = await get_tempo_fetcher(ctx)
 
     def run() -> dict[str, Any]:
@@ -675,7 +678,7 @@ async def get_timesheet_approval(
     # Today in the server's local time zone: the user's day, not UTC's.
     today = datetime.now(timezone.utc).astimezone().date()
     day = parse_date(date, "date") if date else today.isoformat()
-    jira = await get_jira_fetcher(ctx)
+    jira = await get_tempo_jira_fetcher(ctx)
     tempo = await get_tempo_fetcher(ctx)
 
     def run() -> dict[str, Any]:
@@ -801,7 +804,7 @@ async def create_worklog(
     requested_attributes = _parse_attributes_param(attributes)
     key = issue_key
 
-    jira = await get_jira_fetcher(ctx)
+    jira = await get_tempo_jira_fetcher(ctx)
     tempo = await get_tempo_fetcher(ctx)
 
     def run() -> dict[str, Any]:
@@ -911,7 +914,7 @@ async def update_worklog(
     ):
         raise ValueError("Nothing to update: give at least one field to change.")
 
-    jira = await get_jira_fetcher(ctx)
+    jira = await get_tempo_jira_fetcher(ctx)
     tempo = await get_tempo_fetcher(ctx)
 
     def run() -> dict[str, Any]:
